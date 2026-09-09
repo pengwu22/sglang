@@ -323,13 +323,6 @@ def build_kv_cache(
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            if enable_hierarchical_cache:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models currently supports only "
-                    "device-resident cache and is incompatible with "
-                    "--enable-hierarchical-cache."
-                )
             if getattr(model_config, "is_deepseek_v4_arch", False):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache does not support "
