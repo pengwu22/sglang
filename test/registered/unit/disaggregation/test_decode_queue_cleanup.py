@@ -75,6 +75,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = MagicMock(page_size=page_size)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue.token_to_kv_pool_allocator.swa_available_size.return_value = physical_available
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
