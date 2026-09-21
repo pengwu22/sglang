@@ -42,6 +42,9 @@ register_cuda_ci(est_time=700, stage="extra-b", runner_config="8-gpu-h200")
 
 SWA_SERVER_ARGS = ["--page-size", "64", "--attention-backend", "triton"]
 HICACHE_SERVER_ARGS = [
+    # Keep host-cache allocation bounded on GPUs with large device memory.
+    "--max-total-tokens",
+    "65536",
     "--enable-hierarchical-cache",
     "--hicache-ratio",
     "1.2",
@@ -194,11 +197,11 @@ class TestDisaggregationDecodeRadixHiCacheSWAL2Restore(PDDisaggregationServerBas
     # resident, so each turn evicts the other's prefix to the host tier.
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
-        "--max-total-tokens",
-        "4096",
         "--enable-metrics",
         *SWA_SERVER_ARGS,
         *HICACHE_SERVER_ARGS,
+        "--max-total-tokens",
+        "4096",
         "--hicache-ratio",
         "4",
     ]
