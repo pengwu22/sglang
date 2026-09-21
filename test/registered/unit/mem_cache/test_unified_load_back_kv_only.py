@@ -31,6 +31,25 @@ def _cache() -> UnifiedRadixCache:
 
 
 class TestLoadBackKvOnly(CustomTestCase):
+    def test_unsupported_decode_hicache_modes_fail_before_pool_setup(self):
+        for backend, mode, linker in (
+            ("rust", "cache", False),
+            ("python", "buffer_only", False),
+            ("python", "cache", True),
+        ):
+            with self.subTest(backend=backend, mode=mode, linker=linker):
+                cache = _cache()
+                cache._tree_core_backend = backend
+                cache.tree_components = (BASE_COMPONENT_TYPE, "mamba")
+                args = SimpleNamespace(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    hicache_host_memory_mode=mode,
+                    enable_unified_cache_external_linker=linker,
+                )
+                with self.assertRaisesRegex(ValueError, "[Dd]ecode HiCache"):
+                    cache.init_hicache(args, None)
+
     def test_kv_only_skips_component_hooks(self):
         cache = _cache()
         comp = Mock(component_type="mamba")
@@ -67,7 +86,8 @@ class TestLoadBackKvOnly(CustomTestCase):
             commit_load_back=Mock(return_value=[]),
         )
         cache._build_sidecar_transfers = Mock(return_value=[])
-        cache.load_back_threshold = 1
+        # A mandatory decode restore must also work below the prefill threshold.
+        cache.load_back_threshold = 256
         cache.token_to_kv_pool_allocator = SimpleNamespace()
         cache._component_available_size = Mock(return_value=10**6)
         cache._apply_cache_actions = Mock()
@@ -119,7 +139,7 @@ class TestLoadBackKvOnly(CustomTestCase):
         self.assertEqual(indices.tolist(), [20, 21])
         self.assertEqual(node, 7)
         cache.load_back.assert_not_called()
-        self.assertFalse(cache.has_ongoing_load_back(7))
+        self.assertEqual(cache.ongoing_load_back, {})
 
 
 if __name__ == "__main__":

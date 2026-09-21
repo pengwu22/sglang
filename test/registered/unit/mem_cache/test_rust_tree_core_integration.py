@@ -762,7 +762,8 @@ def test_set_hicache_enabled_marks_the_tree():
     assert core.enable_hicache
 
 
-def test_hicache_write_through_and_load_back_round_trip():
+@pytest.mark.parametrize("kv_only", [False, True])
+def test_hicache_write_through_and_load_back_round_trip(kv_only):
     core = _tree_core()
     core.set_hicache_enabled()
     _insert(core, [1, 2], [10, 11])
@@ -781,7 +782,9 @@ def test_hicache_write_through_and_load_back_round_trip():
     assert [t.tolist() for t in device_frees[ComponentType.FULL]] == [[10, 11]]
     assert core.component_has_host_value_only(leaf, ComponentType.FULL)
     # Load back host -> device; the match then serves device indices again.
-    kv_xfer, comp_xfers = core.build_load_back_spec(leaf)
+    host_match = core.match_prefix(MatchPrefixParams(key=_key([1, 2]), kv_only=kv_only))
+    assert host_match.host_hit_length == 2
+    kv_xfer, comp_xfers = core.build_load_back_spec(leaf, kv_only=kv_only)
     assert kv_xfer.name == PoolName.KV
     assert kv_xfer.host_indices.tolist() == [100, 101]
     assert kv_xfer.nodes_to_load == [leaf]

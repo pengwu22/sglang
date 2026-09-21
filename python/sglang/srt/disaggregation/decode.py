@@ -731,12 +731,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        token_ids = req.origin_input_ids
+        if self.scheduler.enable_decode_hicache and self._uses_swa_tail_prealloc():
+            fill_len = self._pre_alloc_fill_len(req)
+            token_ids = token_ids[: max(0, fill_len - self._swa_tail_len(fill_len))]
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            token_ids,
+            # Prefill transfers the final prompt state into the admission slot;
+            # copying a cached checkpoint here only allocates and copies state
+            # that the transfer must overwrite.
+            cow_mamba=False,
             include_req=True,
+            kv_only=self.scheduler.enable_decode_hicache,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref; the full receipt

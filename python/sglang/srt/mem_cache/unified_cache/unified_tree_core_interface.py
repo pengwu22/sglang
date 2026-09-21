@@ -397,15 +397,6 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
-    def match_full_prefix(
-        self, key: RadixKey
-    ) -> tuple[int, NodeId, list[CacheAction | ComponentAction]]:
-        """FULL-only match over device- or host-resident FULL KV, ignoring
-        component validators; the deepest node is split at the key end.
-        Returns (matched tokens, that node, split actions)."""
-        ...
-
-    @abstractmethod
     def inc_full_pin(self, node_id: NodeId) -> None:
         """Pin only FULL device values on the node's root path."""
         ...

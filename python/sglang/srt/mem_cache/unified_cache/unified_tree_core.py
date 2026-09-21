@@ -816,7 +816,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, kv_only=params.kv_only)
         return self._match_post_processor(
             params,
             value,
@@ -828,7 +828,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, *, kv_only: bool = False
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -851,18 +851,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
+        components = tuple(
+            comp
+            for comp in self.components
+            if not kv_only or comp.component_type == BASE_COMPONENT_TYPE
+        )
         if separate_device_match:
-            validators = tuple(
-                comp.create_match_validator() for comp in self.components
-            )
+            validators = tuple(comp.create_match_validator() for comp in components)
             device_validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in components
             )
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in components
             )
 
         def _all_valid(validators, node):
@@ -943,38 +946,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             key = key[prefix_len:]
         return matched_len, node.id, pinned_len
 
-    def match_full_prefix(
-        self, key: RadixKey
-    ) -> tuple[int, NodeId, list[CacheAction | ComponentAction]]:
-        """FULL-only match over device- or host-resident FULL KV, independent
-        of the component validators (a tombstoned SWA window or Mamba state
-        does not end it). The deepest node is split at the key end so the
-        returned node covers exactly the matched span. Returns
-        (matched_len, node_id, split_actions)."""
-        key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        key = key.page_aligned(self.page_size)
-        node = self.root_node
-        matched_len = 0
-        actions: list[CacheAction | ComponentAction] = []
-        while len(key) > 0:
-            child = node.children.get(key.child_key(self.page_size))
-            if child is None:
-                break
-            cd = child.component_data[BASE_COMPONENT_TYPE]
-            if cd.value is None and cd.host_value is None:
-                break
-            prefix_len = child.key.match(key, page_size=self.page_size)
-            if prefix_len == 0:
-                break
-            if prefix_len < len(child.key):
-                child, action = self._split_node(child.key, child, prefix_len)
-                if action is not None:
-                    actions.append(action)
-            matched_len += prefix_len
-            node = child
-            key = key[prefix_len:]
-        return matched_len, node.id, actions
-
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
@@ -987,7 +958,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self.components:
-            if comp.component_type == BASE_COMPONENT_TYPE:
+            if comp.component_type == BASE_COMPONENT_TYPE or params.kv_only:
                 continue  # Full uses last_access_time, not LRU
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
@@ -1019,6 +990,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         for component in self.components:
+            if params.kv_only and component.component_type != BASE_COMPONENT_TYPE:
+                continue
             result = component.finalize_match_result_in_tree_core(
                 result=result,
                 params=params,

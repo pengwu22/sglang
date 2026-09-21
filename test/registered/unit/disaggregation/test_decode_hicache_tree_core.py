@@ -82,6 +82,14 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             kv_only=True,
         )
 
+        # Only a stale anchor is recoverable; a failure inside prefetch must
+        # not silently discard the promise after partially staging resources.
+        tree_cache.prefetch_from_storage.side_effect = KeyError("unexpected pool")
+        with self.assertRaisesRegex(KeyError, "unexpected pool"):
+            DecodeHiCachePreallocMixin._start_hicache_prefetch(
+                harness, req, prefix_match
+            )
+
     def test_stale_prefetch_anchor_degrades_to_l2(self):
         tree_cache = SimpleNamespace(
             hicache_storage_pass_prefix_keys=True,

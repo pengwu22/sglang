@@ -1,4 +1,4 @@
-"""UnifiedRadixCache.match_full_prefix: FULL KV lookup independent of component state."""
+"""UnifiedRadixCache.match_prefix(kv_only=True): FULL KV lookup independent of component state."""
 
 import unittest
 from array import array
@@ -104,10 +104,16 @@ def _add_node(tree_core, parent, tokens, *, device: bool, host: bool):
     return node
 
 
+def _full_match(cache, key):
+    result = cache.match_prefix(MatchPrefixParams(key=key, kv_only=True))
+    return len(result.device_indices) + result.host_hit_length, result.best_match_node
+
+
 class TestMatchFullPrefix(CustomTestCase):
     def setUp(self):
         self.cache = _cache()
         self.tree_core = self.cache.tree_core
+        self.tree_core.enable_hicache = True
         root = self.tree_core.root_node
         self.a = _add_node(self.tree_core, root, [1, 2, 3, 4], device=True, host=False)
         self.b = _add_node(
@@ -121,7 +127,7 @@ class TestMatchFullPrefix(CustomTestCase):
         self.assertEqual(len(result.device_indices), 0)
         self.assertEqual(result.host_hit_length, 0)
 
-        matched_len, node_id = self.cache.match_full_prefix(key)
+        matched_len, node_id = _full_match(self.cache, key)
 
         self.assertEqual(matched_len, 8)
         self.assertEqual(node_id, self.b.id)
@@ -139,8 +145,8 @@ class TestMatchFullPrefix(CustomTestCase):
         c = _add_node(self.tree_core, self.b, [9, 10], device=False, host=True)
         _add_node(self.tree_core, c, [11, 12], device=False, host=False)
 
-        matched_len, node_id = self.cache.match_full_prefix(
-            _key([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        matched_len, node_id = _full_match(
+            self.cache, _key([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
         )
 
         self.assertEqual(matched_len, 10)
@@ -148,7 +154,7 @@ class TestMatchFullPrefix(CustomTestCase):
         self.assertTrue(self.tree_core.is_full_device_evicted(node_id))
 
     def test_splits_the_deepest_node_at_the_key_end(self):
-        matched_len, node_id = self.cache.match_full_prefix(_key([1, 2, 3, 4, 5, 6]))
+        matched_len, node_id = _full_match(self.cache, _key([1, 2, 3, 4, 5, 6]))
 
         self.assertEqual(matched_len, 6)
         split = self.tree_core.node_by_id(node_id)
@@ -162,7 +168,7 @@ class TestMatchFullPrefix(CustomTestCase):
         )
 
     def test_diverging_key_stops_at_the_last_full_node(self):
-        matched_len, node_id = self.cache.match_full_prefix(_key([1, 2, 3, 4, 50, 60]))
+        matched_len, node_id = _full_match(self.cache, _key([1, 2, 3, 4, 50, 60]))
 
         self.assertEqual(matched_len, 4)
         self.assertEqual(node_id, self.a.id)

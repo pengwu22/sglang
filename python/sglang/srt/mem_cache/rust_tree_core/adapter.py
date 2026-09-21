@@ -566,6 +566,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._binding.all_mamba_values_flatten()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if params.kv_only and set(self.tree_components) != {ComponentType.FULL}:
+            raise NotImplementedError(
+                "KV-only hybrid matching requires the Python tree core"
+            )
         key = params.key
         result = self._binding.match_prefix(
             self._bindings.MatchParamsBinding(
@@ -575,14 +579,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         )
         return _match_result_from_binding(result)
-
-    def match_full_prefix(
-        self, key: RadixKey
-    ) -> tuple[int, NodeId, list[CacheAction | ComponentAction]]:
-        raise NotImplementedError(
-            "FULL-only (KV-only decode restore) match is not supported by the "
-            "Rust tree core"
-        )
 
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
         return self._binding.match_full_device_prefix(
@@ -811,7 +807,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_load_back_spec(
         self, node_id: NodeId, req: Optional[Req] = None, kv_only: bool = False
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
-        if kv_only:
+        if kv_only and set(self.tree_components) != {ComponentType.FULL}:
             raise NotImplementedError(
                 "KV-only load-back is not supported by the Rust tree core"
             )

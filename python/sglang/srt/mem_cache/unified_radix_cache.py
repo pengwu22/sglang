@@ -409,6 +409,23 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if (
+            server_args.disaggregation_mode == "decode"
+            and server_args.disaggregation_decode_enable_radix_cache
+        ):
+            if self._has_component_pools and self._tree_core_backend != "python":
+                raise ValueError(
+                    "Hybrid decode HiCache requires the Python tree core "
+                    "(SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python)."
+                )
+            if (
+                server_args.hicache_host_memory_mode != "cache"
+                or server_args.enable_unified_cache_external_linker
+            ):
+                raise ValueError(
+                    "Decode HiCache requires host-memory cache mode without "
+                    "an external cache linker."
+                )
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
@@ -566,17 +583,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
         for component in self._components_tuple:
+            if params.kv_only and component.component_type != BASE_COMPONENT_TYPE:
+                continue
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
-
-    def match_full_prefix(self, key: RadixKey) -> tuple[int, NodeId]:
-        matched_len, node_id, actions = self.tree_core.match_full_prefix(key)
-        self._apply_cache_actions(actions)
-        return matched_len, node_id
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -1739,7 +1753,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # when the Full-KV load is skipped by thresholding. max(1, ...): an
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
-        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
+        # Decode has already promised these pages to prefill. The optional
+        # prefill cost threshold must not turn a small mandatory restore into
+        # missing KV after the P->D transfer has been trimmed.
+        threshold = 1 if kv_only else max(1, self.load_back_threshold)
+        if (kv_tokens < threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -3390,7 +3408,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             # A KV-only consumer only needs the FULL KV, which is resident;
             # the host hit is component state (SWA / Mamba) it never restores.
-            # No DMA: the caller sees this via has_ongoing_load_back().
+            # No new DMA; the caller still fences any earlier load of these pages.
             return (
                 self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
@@ -3505,9 +3523,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
-
-    def has_ongoing_load_back(self, node_id: NodeId) -> bool:
-        return node_id in self.ongoing_load_back
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.

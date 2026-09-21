@@ -71,6 +71,9 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Decode restores historical KV; live component state comes from prefill.
+    kv_only: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -388,17 +391,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
-    def match_full_prefix(self, key: RadixKey) -> tuple[int, Any]:
-        """Deepest node whose FULL KV is device- or host-resident for ``key``,
-        as (matched_len, node), ignoring component (SWA / Mamba) state. A
-        KV-only consumer (the P/D decode restore) locates its KV this way;
-        without component pools it is the regular match."""
-        result = self.match_prefix(MatchPrefixParams(key=key))
-        return (
-            len(result.device_indices) + result.host_hit_length,
-            result.best_match_node,
-        )
-
     def supports_fast_match_prefix(self) -> bool:
         return False
 
@@ -562,11 +554,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
-
-    def has_ongoing_load_back(self, node_id: Any) -> bool:
-        """Whether init_load_back issued a DMA for ``node_id`` that is still in
-        flight. Caches that always DMA on a host hit keep the default."""
-        return True
 
     def ready_to_load_host_cache(self) -> Any:
         """

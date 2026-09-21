@@ -18,6 +18,7 @@ import time
 import unittest
 
 import requests
+from prometheus_client.parser import text_string_to_metric_families
 from test_disaggregation_decode_radix_cache import (
     DisaggregationDecodeRadixCacheTestMixin,
     _has_mooncake,
@@ -189,12 +190,13 @@ class TestDisaggregationDecodeRadixHiCacheSWAL2Restore(PDDisaggregationServerBas
     extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_decode_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_prefill_args = [*SWA_SERVER_ARGS, *HICACHE_SERVER_ARGS]
-    # 96 pages of device KV: two ~3K-token conversations cannot both stay
+    # 64 pages of device KV: two >2K-token conversations cannot both stay
     # resident, so each turn evicts the other's prefix to the host tier.
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
         "--max-total-tokens",
-        "6144",
+        "4096",
+        "--enable-metrics",
         *SWA_SERVER_ARGS,
         *HICACHE_SERVER_ARGS,
         "--hicache-ratio",
@@ -230,6 +232,18 @@ class TestDisaggregationDecodeRadixHiCacheSWAL2Restore(PDDisaggregationServerBas
         return output
 
     def test_interleaved_conversations_restore_from_host(self):
+        def restored_tokens():
+            response = requests.get(f"{self.decode_url}/metrics", timeout=30)
+            response.raise_for_status()
+            return sum(
+                sample.value
+                for family in text_string_to_metric_families(response.text)
+                for sample in family.samples
+                if sample.name == "sglang:load_back_tokens_total"
+                and sample.labels.get("pool") == "kv"
+            )
+
+        restore_before = restored_tokens()
         tokenizer = get_tokenizer(self.model)
         histories = [
             list(
@@ -265,6 +279,9 @@ class TestDisaggregationDecodeRadixHiCacheSWAL2Restore(PDDisaggregationServerBas
             )
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+        self.assertGreater(
+            restored_tokens(), restore_before, "decode never restored KV from host"
+        )
 
 
 if __name__ == "__main__":

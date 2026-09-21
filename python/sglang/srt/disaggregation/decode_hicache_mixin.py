@@ -15,7 +15,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -98,9 +97,8 @@ class DecodeHiCachePreallocMixin:
                     cache_salt=req.cache_salt,
                 )
 
-        # Cap the restored (L2/L3) range at the sliding-window start, like
-        # the L1 cap in pop_preallocated. L2 nodes cannot split mid-node
-        # (degrade to none); L3 trims to the page-aligned cap.
+        # Admission bounds the tree match at the sliding-window start.
+        # Keep the L3 query within that same bound, page aligned.
         if (
             l2_host_hit_length + l3_storage_hit_length > 0
             and self._uses_swa_tail_prealloc()
@@ -139,44 +137,18 @@ class DecodeHiCachePreallocMixin:
             or prefix_match.last_host_node is None
         ):
             return
+        matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
+        suffix = req.origin_input_ids[
+            matched_len : matched_len + prefix_match.l3_storage_hit_length
+        ]
         try:
-            matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
-                matched_len : matched_len + prefix_match.l3_storage_hit_length
-            ]
             last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
             prefix_keys = (
                 self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
-            self.tree_cache.prefetch_from_storage(
-                req.cache_request_handle,
-                prefix_match.last_host_node,
-                suffix,
-                last_hash,
-                prefix_keys,
-                extra_key=req.extra_key,
-                cache_salt=req.cache_salt,
-                # Base KV only, like the load-back: SWA / Mamba state comes
-                # from the transfer, and hybrid component fetches are
-                # all-or-nothing, which the KV-only hit query cannot promise.
-                kv_only=True,
-            )
-            prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
-                req.cache_request_handle
-            )
-            if not prefix_match.prefetch_registered:
-                # A silently declined prefetch leaves the promised L3 range
-                # unrestorable; degrade to L2-only.
-                logger.warning(
-                    "HiCache L3 prefetch declined for rid=%s (len=%s); "
-                    "falling back to L2-only LoadingBack",
-                    req.rid,
-                    prefix_match.l3_storage_hit_length,
-                )
-                prefix_match.l3_storage_hit_length = 0
-        except Exception as e:
+        except KeyError as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
                 req.rid,
@@ -184,6 +156,33 @@ class DecodeHiCachePreallocMixin:
             )
             prefix_match.l3_storage_hit_length = 0
             prefix_match.prefetch_registered = False
+            return
+        self.tree_cache.prefetch_from_storage(
+            req.cache_request_handle,
+            prefix_match.last_host_node,
+            suffix,
+            last_hash,
+            prefix_keys,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            # Base KV only, like the load-back: SWA / Mamba state comes
+            # from the transfer, and hybrid component fetches are
+            # all-or-nothing, which the KV-only hit query cannot promise.
+            kv_only=True,
+        )
+        prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
+            req.cache_request_handle
+        )
+        if not prefix_match.prefetch_registered:
+            # A silently declined prefetch leaves the promised L3 range
+            # unrestorable; degrade to L2-only.
+            logger.warning(
+                "HiCache L3 prefetch declined for rid=%s (len=%s); "
+                "falling back to L2-only LoadingBack",
+                req.rid,
+                prefix_match.l3_storage_hit_length,
+            )
+            prefix_match.l3_storage_hit_length = 0
 
     def _hicache_pending_restore_tokens(self) -> int:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
@@ -234,12 +233,13 @@ class DecodeHiCacheTransferMixin:
             decode_req.hicache_restore_lock_receipt = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
-        """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
+        """Prepare one restore; True when its indices need a completion fence.
 
         On success, ``dr.hicache_restored_node`` and ``hicache_restored_kv_indices``
         are populated, and an inc_lock_ref is held until commit/abort.
-        Trivial cases (all-on-device / no needed coverage) auto-flip to READY.
-        Failback paths flip to FAILED.
+        Resident indices may belong to another request's unfinished DMA.
+        The caller binds both resident and newly loaded indices to an event.
+        Missing coverage flips to FAILED.
         """
         pm = dr.prefix_match
 
@@ -249,35 +249,20 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
-        # Re-match: req.last_node / prefix_indices updated to current device state.
+        # Admission and restore use the same FULL-only match, bounded by the
+        # promise. Component state belongs to the prefill transfer.
         rematch = match_prefix_for_req(
             self.tree_cache,
             dr.req,
-            dr.req.origin_input_ids,
-            cow_mamba=False,
+            dr.req.origin_input_ids[: pm.decode_prefix_len],
             include_req=True,
+            kv_only=True,
         )
-        # Base KV only: the SWA window and the Mamba state of a P/D decode
-        # request come from the prefill transfer, which lands in the slots
-        # registered at prealloc. A restored checkpoint would race it and is
-        # the wrong state for a prompt that runs past the checkpoint anyway.
-        # The promise was made KV-only too (L3 hit query), so locate the KV
-        # the same way: the all-component rematch ends at FULL nodes whose
-        # component state is tombstoned (a shared prefix whose SWA window
-        # belongs to other requests' tails) and would fail the coverage check.
-        full_len, full_node = self.tree_cache.match_full_prefix(
-            RadixKey(
-                dr.req.origin_input_ids[: pm.decode_prefix_len],
-                extra_key=dr.req.extra_key,
-                cache_salt=dr.req.cache_salt,
-            )
-        )
-        device_len = len(rematch.device_indices)
-        if full_len > device_len:
+        if rematch.host_hit_length > 0:
             new_indices, restored_node = self.tree_cache.init_load_back(
                 InitLoadBackParams(
-                    best_match_node=full_node,
-                    host_hit_length=full_len - device_len,
+                    best_match_node=rematch.best_match_node,
+                    host_hit_length=rematch.host_hit_length,
                     req=dr.req,
                     kv_only=True,
                 )
@@ -316,28 +301,33 @@ class DecodeHiCacheTransferMixin:
             restored_node
         ).to_dec_params()
 
-        if len(new_indices) == 0 or not self.tree_cache.has_ongoing_load_back(
-            restored_node
-        ):
-            # Whole prefix already on device (or only component state was
-            # host-resident, which a KV-only restore never fetches); no DMA.
-            dr.hicache_restore_status = HiCacheRestoreResult.READY
-            return False
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
         if not hasattr(self.tree_cache, "is_load_back_event_done"):
             return
 
-        # Filter once: keep only PENDING reqs that still need restore work;
-        # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
+        counter = self.tree_cache.cache_controller.layer_done_counter
+        # Even an L1 hit can refer to indices published by an unfinished DMA.
+        # All H->D operations share a stream, so the latest producer fences
+        # every earlier load, including loads anchored on an ancestor or a node
+        # that has since split. Node-id membership cannot establish readiness.
         active: List[DecodeRequest] = []
         for dr in decode_reqs:
             if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
                 continue
             pm = dr.prefix_match
             if pm is None or not pm.needs_local_restore:
-                dr.hicache_restore_status = HiCacheRestoreResult.READY
+                if dr.hicache_load_consumer_index < 0:
+                    dr.hicache_load_consumer_index = counter.producer_index
+                if (
+                    pm is None
+                    or pm.l1_prefix_len == 0
+                    or self.tree_cache.is_load_back_event_done(
+                        dr.hicache_load_consumer_index
+                    )
+                ):
+                    dr.hicache_restore_status = HiCacheRestoreResult.READY
                 continue
             active.append(dr)
 
@@ -354,7 +344,6 @@ class DecodeHiCacheTransferMixin:
         # Phase B: queue new load_back ops if the next slot is free.
         # The (producer_index + 1) check ensures we never overwrite a still-in-flight slot:
         # if a previous req holds that slot and isn't done, its event won't be signaled.
-        counter = self.tree_cache.cache_controller.layer_done_counter
         if not self.tree_cache.is_load_back_event_done(
             (counter.producer_index + 1) % counter.num_counters
         ):
@@ -371,11 +360,12 @@ class DecodeHiCacheTransferMixin:
         # Phase C: kick off merged DMA, bind consumer_index for Phase A polling next tick.
         consumer_index = self.tree_cache.ready_to_load_host_cache()
         if consumer_index < 0:
-            for dr in queued:
-                dr.hicache_restore_status = HiCacheRestoreResult.READY
-            return
+            consumer_index = counter.producer_index
         for dr in queued:
             dr.hicache_load_consumer_index = consumer_index
+        if self.tree_cache.is_load_back_event_done(consumer_index):
+            for dr in queued:
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
 
     def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
         prefix_match = decode_req.prefix_match

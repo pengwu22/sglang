@@ -5897,6 +5897,216 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(_node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
+    def test_hicache_decode_admission_restore_and_commit(self):
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCacheTransferMixin,
+            HiCacheRestoreResult,
+        )
+
+        cache, allocator, pool = self._build_hicache_fixture()
+        pages = max(4, (self.cfg.sliding_window_size or 0) // self.cfg.page_size + 1)
+        tokens = self._make_seq(1, pages)
+        self._insert(cache, allocator, pool, tokens)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self._fill_full_kv(allocator, match.device_indices, marker=3)
+        expected = self._snapshot_full_kv(allocator, match.device_indices)
+        self._backup_node(cache, match.last_device_node)
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+
+        req = self._make_req(pool)
+        req.origin_input_ids = array("q", tokens + self._make_seq(9000, pages))
+        if self.cfg.has_mamba:
+            state_idx = req.kv.mamba_pool_idx.reshape(-1)
+            self._fill_mamba_state(pool, state_idx, marker=27)
+            expected_state = self._snapshot_mamba_state(pool, state_idx)
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = cache
+        queue.token_to_kv_pool_allocator = allocator
+        queue.token_to_kv_pool = allocator.get_kvcache()
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=True, sliding_window_size=self.cfg.sliding_window_size
+        )
+        prefix = queue._match_prefix_and_lock(req)
+        self.assertEqual(prefix.l1_prefix_len, 0)
+        self.assertEqual(prefix.l2_host_hit_length, len(tokens))
+        pool.req_to_token[
+            req.kv.req_pool_idx, len(tokens) : len(req.origin_input_ids)
+        ] = -7
+        dr = DecodeRequest(req=req, kv_receiver=None, prefix_match=prefix)
+        transfer = DecodeHiCacheTransferMixin()
+        transfer.tree_cache = cache
+        transfer._process_hicache_local_restores([dr])
+        cache.cache_controller.layer_done_counter.events[
+            dr.hicache_load_consumer_index
+        ].finish_event.synchronize()
+        transfer._process_hicache_local_restores([dr])
+        self.assertEqual(dr.hicache_restore_status, HiCacheRestoreResult.READY)
+        transfer._commit_hicache_local_restore_to_req(dr)
+        self.assertIsNone(dr.hicache_restored_node)
+        actual = self._snapshot_full_kv(allocator, req.prefix_indices)
+        for got, want in zip(actual, expected):
+            self.assertTrue(torch.equal(got, want))
+        self.assertTrue(
+            (
+                pool.req_to_token[
+                    req.kv.req_pool_idx, len(tokens) : len(req.origin_input_ids)
+                ]
+                == -7
+            ).all()
+        )
+        if self.cfg.has_mamba:
+            actual_state = self._snapshot_mamba_state(pool, state_idx)
+            self.assertTrue(torch.equal(actual_state[0], expected_state[0]))
+            for got, want in zip(actual_state[1], expected_state[1]):
+                self.assertTrue(torch.equal(got, want))
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        cache.sanity_check()
+
+    def test_hicache_decode_restore_preserves_live_components(self):
+        """Compare selective and tree-owned all-component restores on real pools."""
+        for kv_only in (False, True):
+            with self.subTest(kv_only=kv_only):
+                cache, allocator, pool = self._build_hicache_fixture()
+                pages = max(
+                    4, (self.cfg.sliding_window_size or 0) // self.cfg.page_size + 1
+                )
+                tokens = self._make_seq(1, pages)
+                self._insert(cache, allocator, pool, tokens)
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                )
+                self.assertEqual(len(match.device_indices), len(tokens))
+                node = match.last_device_node
+                self._fill_full_kv(allocator, match.device_indices, marker=3)
+                expected = self._snapshot_full_kv(allocator, match.device_indices)
+                self._backup_node(cache, node)
+                cache.evict(EvictParams(num_tokens=len(tokens)))
+                self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+
+                live = self._make_req(pool)
+                if self.cfg.has_mamba:
+                    live_idx = live.kv.mamba_pool_idx.reshape(-1)
+                    self._fill_mamba_state(pool, live_idx, marker=27)
+                    expected_state = self._snapshot_mamba_state(pool, live_idx)
+                swa_before = allocator.swa_available_size() if self.cfg.has_swa else 0
+                mamba_before = (
+                    pool.mamba_allocator.available_size() if self.cfg.has_mamba else 0
+                )
+
+                # No live Req: the all-component comparison restores a separate
+                # tree checkpoint, not the slot owned by the P/D transfer.
+                self.assertTrue(cache.load_back(node, req=None, kv_only=kv_only))
+                consumer = cache.ready_to_load_host_cache()
+                cache.cache_controller.layer_done_counter.events[
+                    consumer
+                ].finish_event.synchronize()
+                self.assertTrue(cache.is_load_back_event_done(consumer))
+                loaded = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)), kv_only=True)
+                )
+                self.assertEqual(len(loaded.device_indices), len(tokens))
+                actual = self._snapshot_full_kv(allocator, loaded.device_indices)
+                for got, want in zip(actual, expected):
+                    self.assertTrue(torch.equal(got, want))
+                if self.cfg.has_mamba:
+                    actual_state = self._snapshot_mamba_state(pool, live_idx)
+                    self.assertTrue(torch.equal(actual_state[0], expected_state[0]))
+                    for got, want in zip(actual_state[1], expected_state[1]):
+                        self.assertTrue(torch.equal(got, want))
+                    self.assertEqual(
+                        mamba_before - pool.mamba_allocator.available_size(),
+                        0 if kv_only else 1,
+                    )
+                if self.cfg.has_swa:
+                    used = swa_before - allocator.swa_available_size()
+                    if kv_only:
+                        self.assertEqual(used, 0)
+                    else:
+                        self.assertGreater(used, 0)
+                cache.sanity_check()
+
+    def test_hicache_decode_restore_without_spare_mamba_slot(self):
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba")
+        cache, allocator, pool = self._build_hicache_fixture()
+        pages = max(4, (self.cfg.sliding_window_size or 0) // self.cfg.page_size + 1)
+        tokens = self._make_seq(1, pages)
+        self._insert(cache, allocator, pool, tokens)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        node = match.last_device_node
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+        held = pool.mamba_allocator.alloc(pool.mamba_allocator.available_size())
+        self.addCleanup(pool.mamba_allocator.free, held)
+        self.assertFalse(cache.load_back(node, req=None))
+        self.assertTrue(cache.load_back(node, req=None, kv_only=True))
+        consumer = cache.ready_to_load_host_cache()
+        cache.cache_controller.layer_done_counter.events[
+            consumer
+        ].finish_event.synchronize()
+        self.assertTrue(cache.is_load_back_event_done(consumer))
+        self.assertEqual(pool.mamba_allocator.available_size(), 0)
+        cache.sanity_check()
+
+    def test_hicache_decode_l3_prefix_without_checkpoint(self):
+        """A KV page prefix need not end on a stored recurrent checkpoint."""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        prod, allocator, pool = build_fixture(self.cfg)
+        self._init_hicache(
+            prod, storage_backend="file", storage_dir=directory, prefetch_threshold=1
+        )
+        pages = max(4, (self.cfg.sliding_window_size or 0) // self.cfg.page_size + 2)
+        tokens = self._make_seq(1, pages)
+        self._insert(prod, allocator, pool, tokens)
+        match = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self._fill_full_kv(allocator, match.device_indices, marker=7)
+        expected = self._snapshot_full_kv(
+            allocator, match.device_indices[: -self.cfg.page_size]
+        )
+        self._backup_node(prod, match.last_device_node)
+        self._write_path_to_l3(prod, match.last_device_node)
+        self._flush_l3_backups(prod)
+
+        prefix = array("q", tokens[: -self.cfg.page_size])
+        for kv_only in (False, True):
+            with self.subTest(kv_only=kv_only):
+                cons, cons_alloc, _ = build_fixture(self.cfg)
+                self._init_hicache(
+                    cons,
+                    storage_backend="file",
+                    storage_dir=directory,
+                    prefetch_threshold=1,
+                )
+                root = cons.root_node_handle()
+                self.assertEqual(
+                    cons.query_storage_hit_length(root, prefix), len(prefix)
+                )
+                handle = CacheRequestHandle("decode-prefix", 0)
+                cons.prefetch_from_storage(handle, root, prefix, kv_only=kv_only)
+                self._run_prefetch_to_completion(cons, handle)
+                result = cons.match_prefix(
+                    MatchPrefixParams(key=RadixKey(prefix), kv_only=True)
+                )
+                if self.cfg.has_mamba and not kv_only:
+                    self.assertEqual(result.host_hit_length, 0)
+                    continue
+                self.assertEqual(result.host_hit_length, len(prefix))
+                self.assertTrue(cons.load_back(result.best_match_node, kv_only=True))
+                consumer = cons.ready_to_load_host_cache()
+                cons.cache_controller.layer_done_counter.events[
+                    consumer
+                ].finish_event.synchronize()
+                self.assertTrue(cons.is_load_back_event_done(consumer))
+                result = cons.match_prefix(
+                    MatchPrefixParams(key=RadixKey(prefix), kv_only=True)
+                )
+                actual = self._snapshot_full_kv(cons_alloc, result.device_indices)
+                for got, want in zip(actual, expected):
+                    self.assertTrue(torch.equal(got, want))
+                cons.sanity_check()
+
     def test_hicache_load_back_restores_data(self):
         """Loading back an evicted node restores the backed-up cache data."""
         if self._skip_unsupported_hicache_test():
