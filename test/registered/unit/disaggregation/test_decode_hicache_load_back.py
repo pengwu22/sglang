@@ -151,6 +151,24 @@ class TestDecodeLoadBackIsKvOnly(CustomTestCase):
 
 class TestDecodeLoadBackCompletion(CustomTestCase):
     @patch("sglang.srt.disaggregation.decode_hicache_mixin.match_prefix_for_req")
+    def test_incomplete_prefetch_does_not_queue_an_unstarted_dma(self, match_prefix):
+        match_prefix.return_value = _rematch(
+            torch.empty(0, dtype=torch.int64), host_hit_length=2
+        )
+        cache = _tree_cache(new_indices=torch.arange(2))
+        dr = _decode_req(prefix_indices=torch.empty(0, dtype=torch.int64), l2=0, l3=4)
+
+        queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+            SimpleNamespace(tree_cache=cache), dr
+        )
+
+        self.assertFalse(queued)
+        self.assertEqual(dr.hicache_restore_status, HiCacheRestoreResult.FAILED)
+        self.assertEqual(dr.req.last_node, dr.prefix_match.last_device_node)
+        cache.init_load_back.assert_not_called()
+        cache.inc_lock_ref.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode_hicache_mixin.match_prefix_for_req")
     def test_shared_prefix_in_one_batch_waits_for_the_same_dma(self, match_prefix):
         match_prefix.side_effect = [
             _rematch(torch.empty(0, dtype=torch.int64), host_hit_length=4),

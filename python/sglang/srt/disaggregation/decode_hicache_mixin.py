@@ -258,7 +258,13 @@ class DecodeHiCacheTransferMixin:
             include_req=True,
             kv_only=True,
         )
-        if rematch.host_hit_length > 0:
+        # A partial L3 fetch cannot fulfill the promise. Do not enqueue a DMA
+        # that this failed request would leave unstarted and locked in the tree.
+        if (
+            rematch.host_hit_length > 0
+            and len(rematch.device_indices) + rematch.host_hit_length
+            >= pm.decode_prefix_len
+        ):
             new_indices, restored_node = self.tree_cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=rematch.best_match_node,
