@@ -113,6 +113,26 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
 
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
+    @patch("sglang.srt.mem_cache.registry.default_radix_cache_factory")
+    def test_hybrid_decode_checks_selected_cache_without_legacy_env(self, factory):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        for hybrid in ("is_hybrid_swa", "is_hybrid_ssm"):
+            ctx = _make_ctx(self, **{hybrid: True})
+            _publish(
+                self,
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+            )
+            with self.subTest(hybrid=hybrid, unified=True):
+                cache = MagicMock(spec=UnifiedRadixCache)
+                factory.return_value = cache
+                self.assertIs(create_tree_cache(ctx), cache)
+            with self.subTest(hybrid=hybrid, unified=False):
+                factory.return_value = MagicMock()
+                with self.assertRaisesRegex(ValueError, "requires UnifiedRadixCache"):
+                    create_tree_cache(ctx)
+
     def test_dispatches_to_registered_factory(self):
         cache = MagicMock()
         cache.supports_streaming_session.return_value = True

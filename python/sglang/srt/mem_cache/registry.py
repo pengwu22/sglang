@@ -243,6 +243,19 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         source = "default"
 
     if (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_radix_cache
+        and (ctx.is_hybrid_swa or ctx.is_hybrid_ssm)
+    ):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if not isinstance(cache, UnifiedRadixCache):
+            raise ValueError(
+                "Hybrid decode radix caching requires UnifiedRadixCache, "
+                f"but the selected cache is {type(cache).__name__}."
+            )
+
+    if (
         get_memory().enable_hierarchical_cache
         and get_memory().hicache_host_memory_mode == "buffer_only"
     ):
