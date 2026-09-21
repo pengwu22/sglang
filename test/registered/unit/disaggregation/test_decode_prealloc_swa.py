@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.separate_buffer_allocator_double import bind_separate_buffer_capacity
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -35,13 +36,20 @@ def _resume_harness(*, swa_available: list[int]) -> tuple[SimpleNamespace, Mock]
         _uses_swa_tail_prealloc=lambda: True,
         _swa_aware_allocatable_token_budgets=lambda count_retracted: (10**6, 10**6),
         _swa_tail_allocatable_token_budget=Mock(return_value=10**6),
+        _allocatable_token_budgets=Mock(return_value=10**6),
         _prealloc_required_tokens=lambda req: (4096, SWA_TAIL_LEN),
         _prealloc_kv_lens=lambda req: (4096, SWA_TAIL_LEN),
         _pre_alloc=calls._pre_alloc,
     )
-    harness._reclaim_swa_tail_capacity = types.MethodType(
-        DecodePreallocQueue._reclaim_swa_tail_capacity, harness
-    )
+    bind_separate_buffer_capacity(harness.token_to_kv_pool_allocator)
+    for name in (
+        "_uses_swa_reservation",
+        "_prealloc_reservation_fits",
+        "_reclaim_swa_tail_capacity",
+    ):
+        setattr(
+            harness, name, types.MethodType(getattr(DecodePreallocQueue, name), harness)
+        )
     return harness, calls
 
 
@@ -71,6 +79,27 @@ class TestResumeRetractedReclaimsSwaTail(CustomTestCase):
         self.assertEqual(resumed, [])
         self.assertEqual(len(harness.retracted_queue), 1)
         calls._pre_alloc.assert_not_called()
+
+    def test_shared_pool_reclaims_full_and_swa_once(self, _get_disagg, _restore):
+        for shortfall in (None, "insufficient shared capacity"):
+            with self.subTest(shortfall=shortfall):
+                harness, calls = _resume_harness(swa_available=[])
+                harness._uses_swa_tail_prealloc = lambda: False
+                allocator = harness.token_to_kv_pool_allocator
+                allocator.prealloc_fits_assumes_reclaim = lambda: True
+                allocator.reclaim_for_prealloc = Mock(return_value=shortfall)
+
+                resumed = DecodePreallocQueue.resume_retracted_reqs(harness)
+
+                allocator.reclaim_for_prealloc.assert_called_once_with(
+                    harness.tree_cache, 4096, SWA_TAIL_LEN
+                )
+                self.assertEqual(len(resumed), int(shortfall is None))
+                self.assertEqual(
+                    len(harness.retracted_queue), int(shortfall is not None)
+                )
+                if shortfall is not None:
+                    calls._pre_alloc.assert_not_called()
 
 
 class TestAllocForDecodePreallocSwa(CustomTestCase):

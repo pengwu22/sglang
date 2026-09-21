@@ -929,22 +929,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_allocatable_tokens=swa_allocatable_tokens,
             ):
                 break
-            if uses_swa_tail_prealloc:
-                # The budget above counts evictable SWA pages; free them before
-                # alloc_extend_swa_tail asks for the tail, as pop_preallocated
-                # does. A shortfall leaves the request retracted.
-                _, swa_len = self._prealloc_kv_lens(req)
-                reclaim_error = self._reclaim_swa_tail_capacity(swa_len, req.rid)
+            if self._uses_swa_reservation():
+                # Admission may count evictable SWA pages. Reclaim through the
+                # allocator so separate and shared pools honor their budgets.
+                full_len, swa_len = self._prealloc_kv_lens(req)
+                reclaim_error = self._reclaim_swa_tail_capacity(
+                    swa_len, req.rid, full_len=full_len
+                )
                 if reclaim_error is not None:
                     logger.warning(reclaim_error)
-                    break
-
-            if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
-                full_len, swa_len = self._prealloc_kv_lens(req)
-                if (
-                    self._reclaim_swa_tail_capacity(swa_len, req.rid, full_len=full_len)
-                    is not None
-                ):
                     break
 
             resumed_reqs.append(req)
