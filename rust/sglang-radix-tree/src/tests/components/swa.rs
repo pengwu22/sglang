@@ -727,6 +727,7 @@ fn finalize(
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),
+            kv_only: false,
         },
         &[],
         0,
@@ -3807,6 +3808,7 @@ fn match_prefix_with_an_empty_key_on_a_swa_core_is_a_clean_miss() {
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &Vec::new(),
         namespace: Default::default(),
+        kv_only: false,
     });
     assert_eq!(result.device_indices.size()[0], 0);
     assert_eq!(result.swa_host_hit_length, 0);
@@ -4598,7 +4600,7 @@ fn fallible_load_back_boundaries_reject_a_bare_window_node() {
             if missing == node_id
     ));
     assert!(matches!(
-        tc.build_load_back_spec(node_id, /* req = */ None),
+        tc.build_load_back_spec(node_id, /* req = */ None, /* kv_only = */ false),
         Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id: missing })
             if missing == node_id
     ));
@@ -5157,7 +5159,11 @@ fn build_load_back_spec_includes_the_swa_transfers() {
     tc.arena
         .set_host_value(n, SWA, Tensor::from_slice(&[30i64]));
     let (kv_xfer, mut comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(n).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(n).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![tc.arena.node(n).id]));
     let swa_xfers = comp_xfers.get_mut(&SWA).unwrap();
@@ -5271,7 +5277,11 @@ fn swa_device_eviction_preserves_a_locked_load_back_destination() {
     set_full_host(&mut tc, n);
     set_swa_host(&mut tc, n);
     let (kv_xfer, mut comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(n).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(n).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     comp_xfers.get_mut(&SWA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[60i64]));
     tc.commit_load_back(
@@ -5300,6 +5310,33 @@ fn swa_device_eviction_preserves_a_locked_load_back_destination() {
     tc.evict_device_end(SWA);
 }
 
+#[test]
+fn kv_only_load_back_spec_skips_tombstoned_swa() {
+    // The P/D decode restore reads FULL KV only; the nodes' SWA state is
+    // tombstoned (neither host nor device), so no SWA transfer may be built.
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(1)
+        },
+        vec![FULL, SWA],
+    );
+    let [a, b] = chain::<2>(&mut tc);
+    let [a_id, b_id] = [a, b].map(|idx| tc.arena.node(idx).id);
+    for idx in [a, b] {
+        set_full_host(&mut tc, idx);
+        tc.update_evictable_leaf_sets_(idx);
+    }
+
+    let (full, transfers) = tc
+        .build_load_back_spec(b_id, None, /* kv_only = */ true)
+        .unwrap();
+
+    assert_eq!(full.nodes_to_load, Some(vec![a_id, b_id]));
+    assert!(transfers.is_empty());
+}
+
 fn check_swa_device_restored_during_full_load_back(pin_ancestor: bool) {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
@@ -5322,7 +5359,9 @@ fn check_swa_device_restored_during_full_load_back(pin_ancestor: bool) {
     let release_params = |receipt: IncLockRefResult| receipt.to_dec_params();
     let host_lock = release_params(tc.inc_host_lock_ref(b_id).unwrap());
     let temporary_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
-    let (full, mut transfers) = tc.build_load_back_spec(b_id, None).unwrap();
+    let (full, mut transfers) = tc
+        .build_load_back_spec(b_id, None, /* kv_only = */ false)
+        .unwrap();
     assert_eq!(full.nodes_to_load, Some(vec![a_id, b_id]));
     assert_eq!(transfers[&SWA][0].nodes_to_load, Some(vec![b_id]));
     transfers.get_mut(&SWA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[60i64]));
@@ -5448,7 +5487,7 @@ fn check_swa_host_eviction_during_full_load_back(lock_ancestor_host: bool) {
             .expect("live anchor"),
     );
     let (kv_xfer, mut comp_xfers) = tc
-        .build_load_back_spec(b_id, /* req = */ None)
+        .build_load_back_spec(b_id, /* req = */ None, /* kv_only = */ false)
         .expect("live anchor");
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![a_id, b_id]));
     let swa_xfer = &mut comp_xfers.get_mut(&SWA).unwrap()[0];
@@ -5547,7 +5586,11 @@ fn build_load_back_spec_degrades_to_empty_on_a_foreign_pin() {
     set_swa_host(&mut tc, b);
     // Anchor `a` models a Full-only load whose SWA slice remains host-only.
     let (kv_xfer, _comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(a).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(a).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     tc.commit_load_back(
         tc.arena.node(a).id,
@@ -5558,7 +5601,11 @@ fn build_load_back_spec_degrades_to_empty_on_a_foreign_pin() {
     .expect("live test node");
     // Anchor `b` must reject its SWA window because `a` has a foreign pin.
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(b).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(b).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     assert_eq!(kv_xfer.host_indices.unwrap().numel(), 0);
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![]));
@@ -5566,7 +5613,11 @@ fn build_load_back_spec_degrades_to_empty_on_a_foreign_pin() {
     tc.finish_load_back(tc.arena.node(a).id)
         .expect("live test node");
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(b).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(b).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![tc.arena.node(b).id]));
     assert_eq!(
@@ -5635,6 +5686,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
         namespace: Default::default(),
+        kv_only: false,
     }
 }
 
@@ -5848,7 +5900,7 @@ fn deep_request_ring_tree_survives_full_backup_evict_and_load_back_rounds() {
             && tc.is_full_device_evicted(anchor).expect("live test node")
         {
             let (kv_xfer, comp_xfers) = tc
-                .build_load_back_spec(anchor, /* req = */ None)
+                .build_load_back_spec(anchor, /* req = */ None, /* kv_only = */ false)
                 .expect("live test node");
             let loaded = kv_xfer.host_indices.as_ref().unwrap().numel();
             let actions = tc
@@ -6338,6 +6390,7 @@ fn finalize_branching(
             &MatchPrefixParams {
                 key: &Vec::new(),
                 namespace: Default::default(),
+                kv_only: false,
             },
             &[],
             0,
@@ -6377,7 +6430,11 @@ fn swa_branching_seqlen_is_none_when_no_aligned_page_lies_beyond_the_window() {
 
 #[test]
 fn insert_reports_whether_it_reached_the_branch_boundary() {
-    for (branching_seqlen, expected) in [(Some(3), true), (Some(4), false), (None, false)] {
+    for (branching_seqlen, expected) in [
+        (Some(3), true),
+        (Some(4), false),
+        (None, /* kv_only = */ false),
+    ] {
         let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
         let result = tc.insert(&InsertParams {
             rotation_base: None,

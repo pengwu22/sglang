@@ -574,22 +574,25 @@ pub struct MatchParamsBinding {
     pub key: Vec<i64>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub kv_only: bool,
 }
 
 #[pymethods]
 impl MatchParamsBinding {
     #[new]
-    #[pyo3(signature = (key, extra_key = None, cache_salt = None))]
+    #[pyo3(signature = (key, extra_key = None, cache_salt = None, kv_only = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        kv_only: bool,
     ) -> PyResult<Self> {
         Ok(MatchParamsBinding {
             key: py_array_to_vec_i64(py, key)?,
             extra_key,
             cache_salt,
+            kv_only,
         })
     }
 }
@@ -1092,6 +1095,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            kv_only: params.kv_only,
         };
         let result = py.allow_threads(|| self.core().match_prefix(&params));
         MatchResultBinding::from_match_result(py, result)
@@ -1928,12 +1932,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
         mamba_pool_idx: Option<PyTensor>,
+        kv_only: bool,
     ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
         let req = Req {
             mamba_pool_idx: mamba_pool_idx.map(|t| t.0),
         };
         let (kv_xfer, comp_xfers) = py
-            .allow_threads(move || self.core().build_load_back_spec(node_id, Some(&req)))
+            .allow_threads(move || {
+                self.core()
+                    .build_load_back_spec(node_id, Some(&req), kv_only)
+            })
             .map_err(tree_core_assertion_error)?;
         Ok((
             transfer_to_py(py, kv_xfer)?,
@@ -2623,6 +2631,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             let params = MatchPrefixParams {
                 key: &key,
                 namespace: KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                kv_only: false,
             };
             self.core().inspect_finalize_component_match_result(
                 component_type,
@@ -3236,14 +3245,18 @@ macro_rules! tree_core_binding {
             }
 
             /// Build the H->D load-back KV transfer plus per-component aux transfers.
-            #[pyo3(signature = (node_id, mamba_pool_idx = None))]
+            #[pyo3(signature = (node_id, mamba_pool_idx = None, kv_only = false))]
             fn build_load_back_spec(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
                 mamba_pool_idx: Option<PyTensor>,
+                kv_only: bool,
             ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
-                catch_native_panic(|| self.inner.build_load_back_spec(py, node_id, mamba_pool_idx))
+                catch_native_panic(|| {
+                    self.inner
+                        .build_load_back_spec(py, node_id, mamba_pool_idx, kv_only)
+                })
             }
 
             /// Commit a successful H->D load-back onto the node; returns its actions.

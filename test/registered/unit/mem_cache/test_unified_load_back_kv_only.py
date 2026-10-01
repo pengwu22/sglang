@@ -6,8 +6,6 @@ from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
-from sglang.srt.mem_cache.unified_cache.components.base import BASE_COMPONENT_TYPE
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -57,33 +55,38 @@ class TestLoadBackKvOnly(CustomTestCase):
             req, comp.prepare_load_back.return_value, True
         )
 
-    def test_kv_only_builds_no_component_transfers(self):
-        # The spec itself must be KV-only: building an SWA transfer for a node
-        # whose SWA state is tombstoned (neither host nor device) asserts.
+    def _transfer_harness(self, kv_tokens: int) -> UnifiedRadixCache:
         cache = _cache()
-        kv_xfer = SimpleNamespace(host_indices=torch.arange(128))
+        kv_xfer = SimpleNamespace(host_indices=torch.arange(kv_tokens))
         cache.tree_core = Mock(
             build_load_back_spec=Mock(return_value=(kv_xfer, {})),
             commit_load_back=Mock(return_value=[]),
         )
         cache._build_sidecar_transfers = Mock(return_value=[])
-        cache.load_back_threshold = 1
+        cache.load_back_threshold = 10
         cache.token_to_kv_pool_allocator = SimpleNamespace()
         cache._component_available_size = Mock(return_value=10**6)
         cache._apply_cache_actions = Mock()
         cache.ongoing_load_back = {}
+        return cache
 
-        ok = cache._load_back_transfers(
+    def _load(self, cache: UnifiedRadixCache, *, kv_only: bool) -> bool:
+        return cache._load_back_transfers(
             node_id=7,
             mem_quota=None,
             req=SimpleNamespace(),
             result=_lock_result("anchor"),
             ancestor_lock_params="anchor",
             host_anchor_params="host",
-            kv_only=True,
+            kv_only=kv_only,
         )
 
-        self.assertTrue(ok)
+    def test_kv_only_builds_no_component_transfers(self):
+        # The spec itself must be KV-only: building an SWA transfer for a node
+        # whose SWA state is tombstoned (neither host nor device) asserts.
+        cache = self._transfer_harness(kv_tokens=128)
+
+        self.assertTrue(self._load(cache, kv_only=True))
         self.assertTrue(
             cache.tree_core.build_load_back_spec.call_args.kwargs["kv_only"]
         )
@@ -91,35 +94,11 @@ class TestLoadBackKvOnly(CustomTestCase):
         commit_args = cache.tree_core.commit_load_back.call_args.args
         self.assertEqual(commit_args[3], {})
 
-    def test_kv_only_resident_full_kv_needs_no_dma(self):
-        # After a KV-only restore the node's FULL KV is on device while its
-        # Mamba / SWA state stays host-only, so a rematch still reports a host
-        # hit. A KV-only consumer must get the resident indices, not a failed
-        # load_back (reported on the PR by HZY-Wade).
-        cache = _cache()
-        cache.buffer_pipeline = None
-        cache.linker = None
-        cache.tree_components = (BASE_COMPONENT_TYPE, "mamba")
-        cache.ongoing_load_back = {}
-        cache.tree_core = Mock(
-            is_full_device_evicted=Mock(return_value=False),
-            collect_full_device_indices=Mock(return_value=torch.tensor([20, 21])),
-        )
-        cache.load_back = Mock()
-        req = SimpleNamespace(
-            rid="req-0", last_node=3, swa_host_hit_length=0, mamba_host_hit_length=1
-        )
-
-        indices, node = cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=7, host_hit_length=2, req=req, kv_only=True
-            )
-        )
-
-        self.assertEqual(indices.tolist(), [20, 21])
-        self.assertEqual(node, 7)
-        cache.load_back.assert_not_called()
-        self.assertFalse(cache.has_ongoing_load_back(7))
+    def test_kv_only_restore_ignores_the_load_back_threshold(self):
+        # A decode restore was promised to prefill; below the recompute
+        # threshold a colocated load-back declines, a KV-only one must not.
+        self.assertFalse(self._load(self._transfer_harness(kv_tokens=4), kv_only=False))
+        self.assertTrue(self._load(self._transfer_harness(kv_tokens=4), kv_only=True))
 
 
 if __name__ == "__main__":

@@ -78,6 +78,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
         namespace: Default::default(),
+        kv_only: false,
     }
 }
 
@@ -1651,7 +1652,11 @@ fn mamba_device_eviction_preserves_a_locked_load_back_destination() {
     set_full_host(&mut tc, n, 10);
     set_mamba_host(&mut tc, n, 20);
     let (kv_xfer, mut comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(n).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(n).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     comp_xfers.get_mut(&MAMBA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[40i64]));
     tc.commit_load_back(
@@ -1696,7 +1701,9 @@ fn check_mamba_device_restored_during_full_load_back(pin_ancestor: bool) {
     let release_params = |receipt: IncLockRefResult| receipt.to_dec_params();
     let host_lock = release_params(tc.inc_host_lock_ref(b_id).unwrap());
     let temporary_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
-    let (full, mut transfers) = tc.build_load_back_spec(b_id, None).unwrap();
+    let (full, mut transfers) = tc
+        .build_load_back_spec(b_id, None, /* kv_only = */ false)
+        .unwrap();
     assert_eq!(full.nodes_to_load, Some(vec![a_id, b_id]));
     assert_eq!(transfers[&MAMBA][0].nodes_to_load, Some(vec![b_id]));
     transfers.get_mut(&MAMBA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[40i64]));
@@ -1807,7 +1814,7 @@ fn check_mamba_host_eviction_during_full_load_back(lock_ancestor_host: bool) {
             .expect("live anchor"),
     );
     let (kv_xfer, mut comp_xfers) = tc
-        .build_load_back_spec(b_id, /* req = */ None)
+        .build_load_back_spec(b_id, /* req = */ None, /* kv_only = */ false)
         .expect("live anchor");
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![a_id, b_id]));
     let mamba_xfer = &mut comp_xfers.get_mut(&MAMBA).unwrap()[0];

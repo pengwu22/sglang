@@ -4,10 +4,10 @@ The decode worker reuses full-attention prefix KV while transferring the SWA
 window fresh per request. This path requires the unified radix tree and validates
 both multi-turn cache hits and two-pass GSM8K accuracy.
 
-The HiCache variant additionally runs the decode tier's hierarchical cache
-(host tier + file L3) on the SWA model: restored L2/L3 ranges are capped at
-the sliding-window start so the SWA tail is still transferred fresh, and
-hybrid models never promise L3 restores the KV-only hit query cannot back.
+The HiCache variants additionally run the decode tier's hierarchical cache
+(host tier + file L3) on the SWA model: decode reuses and restores
+full-attention KV only, up to the sliding-window start, so the SWA tail is
+still transferred fresh.
 """
 
 import asyncio
@@ -18,6 +18,7 @@ import time
 import unittest
 
 import requests
+from prometheus_client.parser import text_string_to_metric_families
 from test_disaggregation_decode_radix_cache import (
     DisaggregationDecodeRadixCacheTestMixin,
     _has_mooncake,
@@ -96,8 +97,6 @@ class TestDisaggregationDecodeRadixHiCacheSWA(
     transfer_backend_name = "mooncake"
     model_name = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
     gsm8k_min_score = 0.45
-    extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-    extra_decode_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_prefill_args = [*SWA_SERVER_ARGS, *HICACHE_SERVER_ARGS]
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
@@ -183,15 +182,14 @@ class TestDisaggregationDecodeRadixHiCacheSWAL2Restore(PDDisaggregationServerBas
     """
 
     transfer_backend_name = "mooncake"
-    extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-    extra_decode_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_prefill_args = [*SWA_SERVER_ARGS, *HICACHE_SERVER_ARGS]
-    # 96 pages of device KV: two ~3K-token conversations cannot both stay
+    # 64 pages of device KV: two >2K-token conversations cannot both stay
     # resident, so each turn evicts the other's prefix to the host tier.
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
         "--max-total-tokens",
-        "6144",
+        "4096",
+        "--enable-metrics",
         *SWA_SERVER_ARGS,
         *HICACHE_SERVER_ARGS,
         "--hicache-ratio",
@@ -226,7 +224,20 @@ class TestDisaggregationDecodeRadixHiCacheSWAL2Restore(PDDisaggregationServerBas
         self.assertTrue(output.success, output.error)
         return output
 
+    def _decode_restored_kv_tokens(self) -> float:
+        response = requests.get(f"{self.decode_url}/metrics", timeout=30)
+        response.raise_for_status()
+        # Every TP rank reports the same count; this test runs decode at TP 1.
+        return sum(
+            sample.value
+            for family in text_string_to_metric_families(response.text)
+            for sample in family.samples
+            if sample.name == "sglang:load_back_tokens_total"
+            and sample.labels.get("pool") == "kv"
+        )
+
     def test_interleaved_conversations_restore_from_host(self):
+        restored_before = self._decode_restored_kv_tokens()
         tokenizer = get_tokenizer(self.model)
         histories = [
             list(
@@ -262,6 +273,13 @@ class TestDisaggregationDecodeRadixHiCacheSWAL2Restore(PDDisaggregationServerBas
             )
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+        # cached_tokens is seeded from prefill's own hit; the decode-side
+        # load-back counter is what proves the host tier served the prefix.
+        self.assertGreater(
+            self._decode_restored_kv_tokens(),
+            restored_before,
+            "decode never restored KV from its host tier",
+        )
 
 
 if __name__ == "__main__":

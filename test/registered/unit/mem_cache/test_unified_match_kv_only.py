@@ -1,4 +1,9 @@
-"""UnifiedRadixCache.match_full_prefix: FULL KV lookup independent of component state."""
+"""KV-only match and load-back spec: FULL KV independent of component state.
+
+The shared unified radix cache suite covers real SWA / Mamba components on
+both TreeCore backends; this CPU test pins the contract with a component
+whose state is always tombstoned.
+"""
 
 import unittest
 from array import array
@@ -104,83 +109,62 @@ def _add_node(tree_core, parent, tokens, *, device: bool, host: bool):
     return node
 
 
-class TestMatchFullPrefix(CustomTestCase):
+class TestMatchKvOnly(CustomTestCase):
     def setUp(self):
         self.cache = _cache()
         self.tree_core = self.cache.tree_core
         root = self.tree_core.root_node
-        self.a = _add_node(self.tree_core, root, [1, 2, 3, 4], device=True, host=False)
+        self.a = _add_node(self.tree_core, root, [1, 2, 3, 4], device=True, host=True)
         self.b = _add_node(
-            self.tree_core, self.a, [5, 6, 7, 8], device=True, host=False
+            self.tree_core, self.a, [5, 6, 7, 8], device=False, host=True
+        )
+
+    def _match(self, tokens, *, kv_only: bool):
+        return self.cache.match_prefix(
+            MatchPrefixParams(key=_key(tokens), kv_only=kv_only)
         )
 
     def test_finds_full_kv_behind_tombstoned_component_state(self):
-        key = _key([1, 2, 3, 4, 5, 6, 7, 8])
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        self.tree_core.set_hicache_enabled()
 
-        result = self.cache.match_prefix(MatchPrefixParams(key=key))
-        self.assertEqual(len(result.device_indices), 0)
-        self.assertEqual(result.host_hit_length, 0)
+        everything = self._match(tokens, kv_only=False)
+        self.assertEqual(len(everything.device_indices), 0)
+        self.assertEqual(everything.host_hit_length, 0)
 
-        matched_len, node_id = self.cache.match_full_prefix(key)
+        result = self._match(tokens, kv_only=True)
 
-        self.assertEqual(matched_len, 8)
-        self.assertEqual(node_id, self.b.id)
         self.assertEqual(
-            self.tree_core.collect_full_device_indices(
-                node_id, self.tree_core.root_node.id
-            ).tolist(),
-            [
-                *self.a.component_data[BASE_COMPONENT_TYPE].value.tolist(),
-                *self.b.component_data[BASE_COMPONENT_TYPE].value.tolist(),
-            ],
+            result.device_indices.tolist(),
+            self.a.component_data[BASE_COMPONENT_TYPE].value.tolist(),
         )
+        self.assertEqual(result.last_device_node, self.a.id)
+        self.assertEqual(result.host_hit_length, 4)
+        self.assertEqual(result.best_match_node, self.b.id)
 
-    def test_host_only_full_kv_matches_and_dead_node_ends_it(self):
-        c = _add_node(self.tree_core, self.b, [9, 10], device=False, host=True)
-        _add_node(self.tree_core, c, [11, 12], device=False, host=False)
+    def test_dead_node_ends_the_match(self):
+        _add_node(self.tree_core, self.b, [9, 10], device=False, host=False)
+        self.tree_core.set_hicache_enabled()
 
-        matched_len, node_id = self.cache.match_full_prefix(
-            _key([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
-        )
+        result = self._match([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], kv_only=True)
 
-        self.assertEqual(matched_len, 10)
-        self.assertEqual(node_id, c.id)
-        self.assertTrue(self.tree_core.is_full_device_evicted(node_id))
-
-    def test_splits_the_deepest_node_at_the_key_end(self):
-        matched_len, node_id = self.cache.match_full_prefix(_key([1, 2, 3, 4, 5, 6]))
-
-        self.assertEqual(matched_len, 6)
-        split = self.tree_core.node_by_id(node_id)
-        self.assertEqual(split.key.token_ids.tolist(), [5, 6])
-        self.assertIs(split.parent, self.a)
-        self.assertIs(self.b.parent, split)
-        self.assertEqual(self.b.key.token_ids.tolist(), [7, 8])
-        self.assertEqual(
-            split.component_data[BASE_COMPONENT_TYPE].value.tolist(),
-            [self.b.id * 100, self.b.id * 100 + 1],
-        )
-
-    def test_diverging_key_stops_at_the_last_full_node(self):
-        matched_len, node_id = self.cache.match_full_prefix(_key([1, 2, 3, 4, 50, 60]))
-
-        self.assertEqual(matched_len, 4)
-        self.assertEqual(node_id, self.a.id)
+        self.assertEqual(result.best_match_node, self.b.id)
+        self.assertEqual(result.host_hit_length, 4)
 
     def test_kv_only_load_back_spec_builds_no_component_transfers(self):
-        # The KV-only restore of an evicted FULL node behind tombstoned SWA
-        # state must not ask the SWA component for a transfer (it asserts).
-        c = _add_node(self.tree_core, self.b, [9, 10], device=False, host=True)
-
+        # Building a component transfer for a node whose state is tombstoned
+        # asserts, so the KV-only restore must not ask for one.
         with self.assertRaises(AssertionError):
-            self.tree_core.build_load_back_spec(c.id)
+            self.tree_core.build_load_back_spec(self.b.id)
 
-        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(c.id, kv_only=True)
+        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(
+            self.b.id, kv_only=True
+        )
 
         self.assertEqual(comp_xfers, {})
         self.assertEqual(
             kv_xfer.host_indices.tolist(),
-            c.component_data[BASE_COMPONENT_TYPE].host_value.tolist(),
+            self.b.component_data[BASE_COMPONENT_TYPE].host_value.tolist(),
         )
 
 

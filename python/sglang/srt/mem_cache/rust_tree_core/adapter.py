@@ -676,17 +676,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 key=_radix_key_buffer(key),
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                kv_only=params.kv_only,
             )
         )
         return _match_result_from_binding(result)
-
-    def match_full_prefix(
-        self, key: RadixKey
-    ) -> tuple[int, NodeId, list[CacheAction | ComponentAction]]:
-        raise NotImplementedError(
-            "FULL-only (KV-only decode restore) match is not supported by the "
-            "Rust tree core"
-        )
 
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
         return self._binding.match_full_device_prefix(
@@ -945,14 +938,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_load_back_spec(
         self, node_id: NodeId, req: Optional[Req] = None, kv_only: bool = False
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
-        if kv_only:
-            raise NotImplementedError(
-                "KV-only load-back is not supported by the Rust tree core"
-            )
         # Component hooks take primitives, not Req: extract its fields here.
         mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
         kv_xfer, comp_xfers = self._binding.build_load_back_spec(
-            node_id, mamba_pool_idx
+            node_id, mamba_pool_idx, kv_only
         )
         kv_xfer = _transfer_from_binding(kv_xfer)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)

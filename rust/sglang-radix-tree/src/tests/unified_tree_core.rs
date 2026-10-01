@@ -1194,6 +1194,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
         namespace: Default::default(),
+        kv_only: false,
     }
 }
 
@@ -1205,6 +1206,7 @@ fn match_params_in_namespace<'a>(
     MatchPrefixParams {
         key,
         namespace: KeyNamespaceRef::new(extra_key, cache_salt),
+        kv_only: false,
     }
 }
 
@@ -1384,6 +1386,7 @@ fn insert_first_write_creates_the_namespace() {
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
+        kv_only: false,
     });
     assert_eq!(result.device_indices.numel(), 0);
     assert_eq!(result.best_match_node_id, tc.root_node_handle(None));
@@ -1397,6 +1400,7 @@ fn match_prefix_empty_query_anchors_at_the_root() {
         let result = tc.match_prefix(&MatchPrefixParams {
             key: &vec![],
             namespace: KeyNamespaceRef::new(extra_key, None),
+            kv_only: false,
         });
         assert_eq!(result.best_match_node_id, root_handle);
         assert_eq!(result.last_device_node_id, root_handle);
@@ -3412,7 +3416,7 @@ fn load_back_commit_emits_gpu_stored_events() {
     let mut tc = events_core(1);
     let leaf = demoted_events_leaf(&mut tc);
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(leaf).id, None)
+        .build_load_back_spec(tc.arena.node(leaf).id, None, /* kv_only = */ false)
         .expect("live test node");
     tc.commit_load_back(
         tc.arena.node(leaf).id,
@@ -3660,6 +3664,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
             namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
+            kv_only: false,
         })
         .best_match_node_id;
     assert_eq!(
@@ -3683,6 +3688,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![7],
             namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
+            kv_only: false,
         })
         .best_match_node_id;
     assert_ne!(split_mid, salted);
@@ -4346,7 +4352,11 @@ fn build_load_back_spec_collects_the_evicted_chain_ancestors_first() {
     demote_node(&mut tc, child);
     demote_node(&mut tc, parent);
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(child).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     assert_eq!(kv_xfer.name, PoolName::Kv);
     assert!(
@@ -4368,7 +4378,11 @@ fn build_load_back_spec_returns_an_empty_transfer_for_a_device_backed_node() {
     let mut tc = core();
     let (_parent, child) = backuped_chain(&mut tc);
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(child).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     let host_indices = kv_xfer.host_indices.unwrap();
     assert_eq!(host_indices.numel(), 0);
@@ -4388,7 +4402,11 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
     tc.full_coexisting_host_nodes.discard(parent);
     tc.full_coexisting_host_nodes.discard(child);
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(child).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     let actions = tc
         .commit_load_back(
@@ -4458,7 +4476,11 @@ fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
     tc.full_coexisting_host_nodes.discard(parent);
     tc.full_coexisting_host_nodes.discard(child);
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(child).id, /* req = */ None)
+        .build_load_back_spec(
+            tc.arena.node(child).id,
+            /* req = */ None,
+            /* kv_only = */ false,
+        )
         .expect("live test node");
     tc.commit_load_back(
         tc.arena.node(child).id,
@@ -4519,7 +4541,7 @@ fn component_has_host_value_only_tracks_the_demote_and_load_back_cycle() {
             .expect("live test node")
     );
     let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(leaf, /* req = */ None)
+        .build_load_back_spec(leaf, /* req = */ None, /* kv_only = */ false)
         .expect("live test node");
     tc.commit_load_back(leaf, Tensor::from_slice(&[30i64]), kv_xfer, comp_xfers)
         .expect("live transfer nodes");
@@ -4602,7 +4624,7 @@ fn fallible_node_boundaries_reject_stale_handles() {
             if node_id == stale_root
     ));
     assert!(matches!(
-        tc.build_load_back_spec(stale_root, /* req = */ None),
+        tc.build_load_back_spec(stale_root, /* req = */ None, /* kv_only = */ false),
         Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
             if node_id == stale_root
     ));
@@ -4989,24 +5011,28 @@ fn dfs_weight_order_groups_the_heaviest_subtree_first() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 99],
             namespace: KeyNamespaceRef::default(),
+            kv_only: false,
         })
         .last_device_node_id;
     let leaf_a1 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 10],
             namespace: KeyNamespaceRef::default(),
+            kv_only: false,
         })
         .last_device_node_id;
     let leaf_a2 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 11],
             namespace: KeyNamespaceRef::default(),
+            kv_only: false,
         })
         .last_device_node_id;
     let leaf_b = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![2, 20],
             namespace: KeyNamespaceRef::default(),
+            kv_only: false,
         })
         .last_device_node_id;
 
@@ -5072,6 +5098,7 @@ fn insert_into_a_named_namespace_is_isolated() {
     let hit = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
+        kv_only: false,
     });
     assert!(hit.device_indices.equal(&Tensor::from_slice(&[10i64, 11])));
 }
@@ -7896,6 +7923,7 @@ fn match_prefix_on_an_unknown_namespace_allocates_nothing() {
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2, 3],
         namespace: KeyNamespaceRef::new(Some("ghost"), None),
+        kv_only: false,
     });
     assert_eq!(result.device_indices.numel(), 0);
     assert_eq!(tc.arena.len(), arena_len);
@@ -7924,6 +7952,7 @@ fn refresh_dispatches_fire_per_walk_phase_in_a_namespace() {
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
             namespace: KeyNamespaceRef::new(Some("chat"), None),
+            kv_only: false,
         })
         .best_match_node_id;
     let refreshes = recorder.refreshes.lock().unwrap();
@@ -8912,6 +8941,7 @@ fn an_emptied_namespace_leaves_nothing_behind() {
     let top = tc
         .match_prefix(&MatchPrefixParams {
             namespace: KeyNamespaceRef::new(Some("salted"), None),
+            kv_only: false,
             ..match_params(&vec![1, 2])
         })
         .best_match_node_id;
@@ -8959,6 +8989,7 @@ fn a_zero_length_match_anchors_at_the_root() {
     let anchor = tc
         .match_prefix(&MatchPrefixParams {
             namespace: KeyNamespaceRef::new(Some("salted"), None),
+            kv_only: false,
             ..match_params(&vec![9])
         })
         .best_match_node_id;

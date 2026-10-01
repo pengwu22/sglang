@@ -6433,6 +6433,153 @@ class UnifiedRadixCacheSuite:
             cache.tree_core.component_evictable_size(component_type) - len(value),
         )
 
+    def _insert_full_behind_component_tombstones(
+        self, cache, allocator, req_to_token_pool
+    ):
+        """Cache a prefix whose FULL KV is resident but whose SWA window or
+        Mamba state is gone -- the P/D decode tier's shared-prefix shape.
+        Returns the prefix tokens, or None when the config cannot build it."""
+        if self.cfg.has_swa:
+            tokens = self._make_seq(1, 4)
+            value = self._alloc(allocator, len(tokens))
+            if value is None:
+                return None
+            params = InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                prev_prefix_len=0,
+                component_evicted_seqlens={ComponentType.SWA: len(tokens)},
+            )
+            if self.cfg.has_mamba:
+                req = self._make_req(req_to_token_pool)
+                params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
+            cache.insert(params)
+            return tokens
+        if self.cfg.has_mamba:
+            # A leaf without Mamba state is evicted outright, so tombstone the
+            # older, internal checkpoint instead.
+            tokens = self._make_seq(1, 2)
+            self._insert(cache, allocator, req_to_token_pool, tokens)
+            self._insert(
+                cache, allocator, req_to_token_pool, tokens + self._make_seq(500, 2)
+            )
+            cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            node = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)), kv_only=True)
+            ).last_device_node
+            self.assertIsNone(_device_value(cache, node, ComponentType.MAMBA))
+            return tokens
+        return None
+
+    def test_kv_only_match_reaches_full_kv_behind_component_tombstones(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = self._insert_full_behind_component_tombstones(
+            cache, allocator, req_to_token_pool
+        )
+        if tokens is None:
+            self.skipTest("requires an auxiliary component and pool room")
+        key = RadixKey(array("q", tokens))
+
+        full = cache.match_prefix(MatchPrefixParams(key=key))
+        kv_only = cache.match_prefix(MatchPrefixParams(key=key, kv_only=True))
+
+        self.assertLess(len(full.device_indices), len(tokens))
+        self.assertEqual(len(kv_only.device_indices), len(tokens))
+        self.assertEqual(kv_only.host_hit_length, 0)
+        self.assertEqual(kv_only.swa_host_hit_length, 0)
+        self.assertEqual(kv_only.mamba_host_hit_length, 0)
+        self.assertIsNone(kv_only.mamba_branching_seqlen)
+        self.assertEqual(
+            torch.cat(
+                [
+                    _device_value(cache, node, ComponentType.FULL)
+                    for node in self._path_chain(cache, kv_only.last_device_node)
+                ]
+            ).tolist(),
+            kv_only.device_indices.tolist(),
+        )
+        cache.sanity_check()
+
+    def test_kv_only_match_splits_at_the_key_end(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = self._insert_full_behind_component_tombstones(
+            cache, allocator, req_to_token_pool
+        )
+        if tokens is None:
+            self.skipTest("requires an auxiliary component and pool room")
+        prefix = tokens[: len(tokens) - self.cfg.page_size]
+
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)), kv_only=True)
+        )
+
+        self.assertEqual(len(result.device_indices), len(prefix))
+        path = self._path_chain(cache, result.last_device_node)
+        self.assertEqual(sum(_node_key_length(cache, n) for n in path), len(prefix))
+        lock = cache.inc_lock_ref(result.last_device_node)
+        self.assertEqual(cache.full_protected_size(), len(prefix))
+        cache.dec_lock_ref(result.last_device_node, lock.to_dec_params())
+        cache.sanity_check()
+
+    def test_hicache_kv_only_restore_of_full_behind_component_tombstones(self):
+        """The P/D decode restore: FULL KV demoted to host behind tombstoned
+        SWA / Mamba state comes back KV-only with its data, and no component
+        state is allocated or restored for it."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        tokens = self._insert_full_behind_component_tombstones(
+            cache, allocator, req_to_token_pool
+        )
+        if tokens is None:
+            self.skipTest("requires an auxiliary component and pool room")
+        key = RadixKey(array("q", tokens))
+        resident = cache.match_prefix(MatchPrefixParams(key=key, kv_only=True))
+        self._fill_full_kv(allocator, resident.device_indices, marker=3)
+        expected_k, expected_v = self._snapshot_full_kv(
+            allocator, resident.device_indices
+        )
+        self._backup_tree(cache)
+        cache.evict(EvictParams(num_tokens=cache.full_evictable_size()))
+        self.assertTrue(
+            cache.tree_core.is_full_device_evicted(resident.last_device_node)
+        )
+
+        req = self._make_req(req_to_token_pool)
+        mamba_available = (
+            req_to_token_pool.mamba_allocator.available_size()
+            if self.cfg.has_mamba
+            else None
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=key, req=req, kv_only=True))
+        self._apply_match_to_req(req, match)
+        self.assertEqual(len(match.device_indices) + match.host_hit_length, len(tokens))
+
+        new_indices, new_node = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+                kv_only=True,
+            )
+        )
+        self._finish_pending_loads(cache)
+
+        loaded = torch.cat([match.device_indices, new_indices])
+        self.assertEqual(len(loaded), len(tokens))
+        loaded_k, loaded_v = self._snapshot_full_kv(allocator, loaded)
+        self.assertTrue(torch.equal(loaded_k, expected_k))
+        self.assertTrue(torch.equal(loaded_v, expected_v))
+        if self.cfg.has_swa:
+            self.assertIsNone(_device_value(cache, new_node, ComponentType.SWA))
+        if self.cfg.has_mamba:
+            self.assertIsNone(_device_value(cache, new_node, ComponentType.MAMBA))
+            self.assertEqual(
+                req_to_token_pool.mamba_allocator.available_size(), mamba_available
+            )
+        self._release_ongoing_load_back_locks(cache)
+        cache.sanity_check()
+
     def test_match_prefix_best_and_device_node_without_hicache(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size

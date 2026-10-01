@@ -560,17 +560,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
         for component in self._components_tuple:
+            if params.kv_only and component.component_type != BASE_COMPONENT_TYPE:
+                continue
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
-
-    def match_full_prefix(self, key: RadixKey) -> tuple[int, NodeId]:
-        matched_len, node_id, actions = self.tree_core.match_full_prefix(key)
-        self._apply_cache_actions(actions)
-        return matched_len, node_id
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -1800,8 +1797,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding. max(1, ...): an
         # entirely empty spec (e.g. foreign-pin rejection) must never report
-        # success, even at load_back_threshold <= 0.
-        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
+        # success, even at load_back_threshold <= 0. A KV-only restore is
+        # already promised to prefill, so the recompute heuristic is moot.
+        threshold = 1 if kv_only else max(1, self.load_back_threshold)
+        if (kv_tokens < threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -3457,19 +3456,6 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
 
-        if params.kv_only and not self.tree_core.is_full_device_evicted(
-            best_match_node_id
-        ):
-            # A KV-only consumer only needs the FULL KV, which is resident;
-            # the host hit is component state (SWA / Mamba) it never restores.
-            # No DMA: the caller sees this via has_ongoing_load_back().
-            return (
-                self.tree_core.collect_full_device_indices(
-                    best_match_node_id, last_best_match_device_node_id
-                ),
-                best_match_node_id,
-            )
-
         if (
             self.tree_core.is_full_device_evicted(best_match_node_id)
             or params.host_hit_length > 0
@@ -3577,9 +3563,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
-
-    def has_ongoing_load_back(self, node_id: NodeId) -> bool:
-        return node_id in self.ongoing_load_back
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after this rank's load-back event is complete."""

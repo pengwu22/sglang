@@ -61,6 +61,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
         namespace: Default::default(),
+        kv_only: false,
     }
 }
 
@@ -1842,6 +1843,7 @@ fn finalize(tc: &UnifiedTreeCore<Vec<i64>>, result: MatchResult) -> MatchResult 
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),
+            kv_only: false,
         },
         &[],
         0,
@@ -2056,6 +2058,7 @@ fn inspect_finalize_rejects_missing_match_nodes() {
     let params = MatchPrefixParams {
         key: &Vec::new(),
         namespace: Default::default(),
+        kv_only: false,
     };
     let result = tc.inspect_finalize_component_match_result(
         FULL,

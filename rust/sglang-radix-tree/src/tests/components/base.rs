@@ -127,6 +127,7 @@ fn finalize_match_result_default_returns_result_unchanged() {
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),
+            kv_only: false,
         },
         &[],
         0,

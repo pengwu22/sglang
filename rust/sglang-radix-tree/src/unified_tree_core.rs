@@ -132,6 +132,9 @@ pub struct MatchPrefixParams<'k, K: ChildKeyType> {
     pub key: &'k K,
     /// Namespace of the query; picks the matching subtree root.
     pub namespace: KeyNamespaceRef<'k>,
+    /// Validate and finalize base (FULL) KV only. For a consumer whose
+    /// auxiliary state arrives from elsewhere (the P/D decode tier).
+    pub kv_only: bool,
 }
 
 /// Params for an insert; the key is borrowed from the caller.
@@ -1145,7 +1148,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self.match_prefix_helper_(root_id, params.namespace, key, aligned_key_len);
+        ) = self.match_prefix_helper_(
+            root_id,
+            params.namespace,
+            key,
+            aligned_key_len,
+            params.kv_only,
+        );
         self.match_post_processor_(
             params,
             root_id,
@@ -1204,6 +1213,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         namespace: KeyNamespaceRef<'_>,
         key: &K,
         aligned_key_len: usize,
+        kv_only: bool,
     ) -> (
         Vec<Tensor>,
         NodeIdx_,
@@ -1234,6 +1244,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
+            if kv_only && component.component_type() != BASE_COMPONENT_TYPE {
+                continue;
+            }
             if separate_device_match {
                 validators.push(
                     component.create_match_validator(self, /* match_device_only = */ false),
@@ -1359,7 +1372,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> MatchResult {
         for i in 0..self.components.len() {
             // Full uses last_access ticks, not LRU.
-            if self.components[i].component_type() == BASE_COMPONENT_TYPE {
+            if params.kv_only || self.components[i].component_type() == BASE_COMPONENT_TYPE {
                 continue;
             }
             let component = Arc::clone(&self.components[i]);
@@ -1410,6 +1423,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
+            if params.kv_only && component.component_type() != BASE_COMPONENT_TYPE {
+                continue;
+            }
             result = component.finalize_match_result_in_tree_core(
                 self,
                 result,
@@ -3644,10 +3660,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Build the H->D load-back KV transfer plus per-component aux transfers.
+    /// `kv_only` builds no component transfers: a KV-only consumer never
+    /// restores component state, which may be tombstoned on the node.
     pub fn build_load_back_spec(
         &self,
         node_id: NodeId,
         req: Option<&Req>,
+        kv_only: bool,
     ) -> Result<(PoolTransfer, HashMap<ComponentType, Vec<PoolTransfer>>), TreeCoreRuntimeError>
     {
         let anchor_id = node_id;
@@ -3672,7 +3691,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>> = HashMap::new();
         for i in 0..self.components.len() {
             let component_type = self.components[i].component_type();
-            if component_type == BASE_COMPONENT_TYPE {
+            if kv_only || component_type == BASE_COMPONENT_TYPE {
                 continue;
             }
             let transfers = self.components[i].build_hicache_transfers(

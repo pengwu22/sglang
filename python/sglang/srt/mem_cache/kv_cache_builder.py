@@ -314,10 +314,9 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode-side radix cache supports SWA only through the unified tree, whose
-    # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. Hybrid SSM/KDA uses UnifiedRadixCache's Mamba
-    # component (match + lock + CoW), the same path as colocated serving.
+    # Decode-side radix cache on hybrid models reuses full-attention KV only;
+    # the SWA window and the SSM/KDA state always come with the prefill
+    # transfer (see DecodePreallocQueue._match_prefix_and_lock).
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"

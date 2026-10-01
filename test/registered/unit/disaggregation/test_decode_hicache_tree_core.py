@@ -38,7 +38,6 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         harness = SimpleNamespace(
             scheduler=SimpleNamespace(enable_decode_hicache=True),
             tree_cache=tree_cache,
-            _uses_swa_tail_prealloc=lambda: False,
         )
         req = SimpleNamespace(
             rid="req-0",
@@ -55,7 +54,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         )
 
         prefix_match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
-            harness, req, result
+            harness, req, result, reusable_len=8
         )
 
         self.assertEqual(prefix_match.l3_storage_hit_length, 2)

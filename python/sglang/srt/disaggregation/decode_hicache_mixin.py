@@ -15,7 +15,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -62,11 +61,14 @@ class HiCacheRestoreResult(Enum):
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
-    def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
+    def _build_decode_prefix_match(
+        self, req: Req, result: Any, reusable_len: int
+    ) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
-        HiCache is enabled and the last host node is backed up.
+        HiCache is enabled and the last host node is backed up. Like the tree
+        match, the query stops at ``reusable_len``.
         """
         prefix_indices = result.device_indices
         l1_prefix_len = len(prefix_indices)
@@ -74,15 +76,13 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        # The hit query is KV-only, which matches what decode fetches
-        # (kv_only prefetch below): component state comes from the transfer.
         if self.scheduler.enable_decode_hicache:
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node
             ):
                 matched_len = l1_prefix_len + l2_host_hit_length
-                suffix_tokens = req.origin_input_ids[matched_len:]
+                suffix_tokens = req.origin_input_ids[matched_len:reusable_len]
                 last_hash = self.tree_cache.get_last_hash_value(last_host_node)
                 prefix_keys = (
                     self.tree_cache.get_prefix_hash_values(last_host_node)
@@ -97,24 +97,6 @@ class DecodeHiCachePreallocMixin:
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                 )
-
-        # Cap the restored (L2/L3) range at the sliding-window start, like
-        # the L1 cap in pop_preallocated. L2 nodes cannot split mid-node
-        # (degrade to none); L3 trims to the page-aligned cap.
-        if (
-            l2_host_hit_length + l3_storage_hit_length > 0
-            and self._uses_swa_tail_prealloc()
-        ):
-            fill_len = self._pre_alloc_fill_len(req)
-            swa_prefix_cap = max(0, fill_len - self._swa_tail_len(fill_len))
-            if l1_prefix_len + l2_host_hit_length > swa_prefix_cap:
-                l2_host_hit_length = 0
-                l3_storage_hit_length = 0
-            else:
-                page_size = self.token_to_kv_pool_allocator.page_size
-                allowed = swa_prefix_cap - l1_prefix_len - l2_host_hit_length
-                l3_storage_hit_length = min(l3_storage_hit_length, allowed)
-                l3_storage_hit_length -= l3_storage_hit_length % page_size
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -158,9 +140,8 @@ class DecodeHiCachePreallocMixin:
                 prefix_keys,
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
-                # Base KV only, like the load-back: SWA / Mamba state comes
-                # from the transfer, and hybrid component fetches are
-                # all-or-nothing, which the KV-only hit query cannot promise.
+                # Base KV only, which the KV-only hit query promised; hybrid
+                # component fetches would be all-or-nothing on top of it.
                 kv_only=True,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
@@ -249,42 +230,26 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
-        # Re-match: req.last_node / prefix_indices updated to current device state.
+        # Re-match the promised range the way admission matched it: FULL KV
+        # only. Restore it KV-only too: the SWA window and the Mamba state
+        # come from the prefill transfer into the slots registered at
+        # prealloc, which a restored checkpoint would race and overwrite.
+        # req.last_node / prefix_indices now reflect the current device state.
         rematch = match_prefix_for_req(
             self.tree_cache,
             dr.req,
-            dr.req.origin_input_ids,
-            cow_mamba=False,
+            dr.req.origin_input_ids[: pm.decode_prefix_len],
             include_req=True,
+            kv_only=True,
         )
-        # Base KV only: the SWA window and the Mamba state of a P/D decode
-        # request come from the prefill transfer, which lands in the slots
-        # registered at prealloc. A restored checkpoint would race it and is
-        # the wrong state for a prompt that runs past the checkpoint anyway.
-        # The promise was made KV-only too (L3 hit query), so locate the KV
-        # the same way: the all-component rematch ends at FULL nodes whose
-        # component state is tombstoned (a shared prefix whose SWA window
-        # belongs to other requests' tails) and would fail the coverage check.
-        full_len, full_node = self.tree_cache.match_full_prefix(
-            RadixKey(
-                dr.req.origin_input_ids[: pm.decode_prefix_len],
-                extra_key=dr.req.extra_key,
-                cache_salt=dr.req.cache_salt,
+        new_indices, restored_node = self.tree_cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=rematch.best_match_node,
+                host_hit_length=rematch.host_hit_length,
+                req=dr.req,
+                kv_only=True,
             )
         )
-        device_len = len(rematch.device_indices)
-        if full_len > device_len:
-            new_indices, restored_node = self.tree_cache.init_load_back(
-                InitLoadBackParams(
-                    best_match_node=full_node,
-                    host_hit_length=full_len - device_len,
-                    req=dr.req,
-                    kv_only=True,
-                )
-            )
-        else:
-            new_indices = rematch.device_indices[:0]
-            restored_node = rematch.last_device_node
         # The rematch repointed req.last_node to feed init_load_back's device
         # boundary, but the prealloc lock and the receipt on the req still
         # belong to pm.last_device_node; restore the pairing so any release
@@ -315,11 +280,8 @@ class DecodeHiCacheTransferMixin:
             restored_node
         ).to_dec_params()
 
-        if len(new_indices) == 0 or not self.tree_cache.has_ongoing_load_back(
-            restored_node
-        ):
-            # Whole prefix already on device (or only component state was
-            # host-resident, which a KV-only restore never fetches); no DMA.
+        if len(new_indices) == 0:
+            # Whole prefix already on device; no DMA needed.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
         return True

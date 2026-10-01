@@ -559,6 +559,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         window_start = (window_start // page_size) * page_size
         return seq_len - window_start
 
+    def _reusable_prefix_len(self, req: Req) -> int:
+        """Longest prompt prefix decode may serve from its own cache. The
+        transfer must carry the whole SWA tail, so reuse stops where it starts."""
+        if not self._uses_swa_tail_prealloc():
+            return len(req.origin_input_ids)
+        fill_len = self._pre_alloc_fill_len(req)
+        return fill_len - self._swa_tail_len(fill_len)
+
     def _swa_retractable_len(self, req: Req) -> int:
         if not self._uses_swa_tail_prealloc():
             return len(req.origin_input_ids) + len(req.output_ids)
@@ -789,12 +797,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        reusable_len = self._reusable_prefix_len(req)
+        # FULL KV only: the SWA window and the Mamba state always come from
+        # the prefill transfer, so the cached ones are neither needed nor
+        # copied, and their absence must not end the match.
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            req.origin_input_ids[:reusable_len],
             include_req=True,
+            kv_only=True,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref; the full receipt
@@ -802,7 +814,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.lock_receipt = self.tree_cache.inc_lock_ref(
             result.last_device_node
         ).to_dec_params()
-        return self._build_decode_prefix_match(req, result)
+        return self._build_decode_prefix_match(req, result, reusable_len)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -979,15 +991,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_allocatable_tokens=swa_allocatable_tokens,
             ):
                 break
-            if uses_swa_tail_prealloc:
-                # The budget above counts evictable SWA pages; free them before
-                # alloc_extend_swa_tail asks for the tail, as pop_preallocated
-                # does. A shortfall leaves the request retracted.
-                _, swa_len = self._prealloc_kv_lens(req)
-                reclaim_error = self._reclaim_swa_tail_capacity(swa_len, req.rid)
-                if reclaim_error is not None:
-                    logger.warning(reclaim_error)
-                    break
 
             if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
                 full_len, swa_len = self._prealloc_kv_lens(req)
@@ -1420,20 +1423,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len = prefix_match.decode_prefix_len
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
-
-                # Cap full-attention prefix reuse at the sliding-window start so
-                # the SWA window lands entirely in the fresh delta, keeping
-                # alloc_extend_swa_tail's tail->full mapping in range. Costs reuse
-                # of only the last ~window_size full-attention tokens.
-                if uses_swa_tail_prealloc and prefix_len > 0:
-                    swa_prefix_cap = fill_len - self._swa_tail_len(fill_len)
-                    if prefix_len > swa_prefix_cap:
-                        prefix_len = swa_prefix_cap
-                        prefix_indices = prefix_indices[:prefix_len]
-                        # Cap the prefill-committed prefix too: tokens past the
-                        # cap are not device-resident, so prefill must transfer
-                        # them.
-                        total_prefix_len = prefix_len
 
                 # Decode transfers the SWA tail fresh, so retain only the
                 # full-attention prefix lock needed for reuse.
