@@ -19,13 +19,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _tree_cache(*, new_indices) -> Mock:
     return Mock(
-        check_prefetch_progress=Mock(return_value=True),
         init_load_back=Mock(return_value=(new_indices, 99)),
         inc_lock_ref=Mock(return_value=Mock(to_dec_params=Mock())),
     )
 
 
-def _decode_req(*, prefix_indices, l2: int, l3: int) -> SimpleNamespace:
+def _decode_req(*, prefix_indices, l2: int) -> SimpleNamespace:
     return SimpleNamespace(
         req=SimpleNamespace(
             rid="req-0",
@@ -38,9 +37,9 @@ def _decode_req(*, prefix_indices, l2: int, l3: int) -> SimpleNamespace:
         prefix_match=DecodePrefixMatch(
             prefix_indices=prefix_indices,
             l2_host_hit_length=l2,
-            l3_storage_hit_length=l3,
             last_device_node=11,
-            last_host_node=None,
+            host_anchor=5 if l2 else None,
+            host_lock="pin" if l2 else None,
         ),
         hicache_restore_status=HiCacheRestoreResult.PENDING,
         hicache_restored_node=None,
@@ -59,10 +58,10 @@ def _rematch(device_indices, *, host_hit_length: int = 0) -> SimpleNamespace:
 @patch("sglang.srt.disaggregation.decode_hicache_mixin.match_prefix_for_req")
 class TestDecodeRestoreIsKvOnly(CustomTestCase):
     def test_rematch_covers_exactly_the_promise_full_kv_only(self, match_prefix):
-        # L1 = 2 on device, L2 = 2 + L3 = 2 promised; the prompt is longer.
+        # L1 = 2 on device, L2 = 4 promised; the prompt is longer.
         match_prefix.return_value = _rematch(torch.tensor([10, 11]), host_hit_length=4)
         tree_cache = _tree_cache(new_indices=torch.tensor([20, 21, 22, 23]))
-        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=2, l3=2)
+        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=4)
 
         DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
             SimpleNamespace(tree_cache=tree_cache), dr
@@ -78,7 +77,7 @@ class TestDecodeRestoreIsKvOnly(CustomTestCase):
     def test_host_hit_queues_a_kv_only_load_back(self, match_prefix):
         match_prefix.return_value = _rematch(torch.tensor([10, 11]), host_hit_length=2)
         tree_cache = _tree_cache(new_indices=torch.tensor([20, 21]))
-        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=2, l3=0)
+        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=2)
 
         queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
             SimpleNamespace(tree_cache=tree_cache), dr
@@ -94,12 +93,15 @@ class TestDecodeRestoreIsKvOnly(CustomTestCase):
         self.assertEqual(dr.hicache_restored_node, 99)
         self.assertEqual(dr.hicache_restored_kv_indices.tolist(), [20, 21])
         self.assertEqual(dr.req.last_node, 11)
+        # The load-back pins the pages it reads; the promise's pin is released.
+        tree_cache.dec_host_lock_ref.assert_called_once_with(5, "pin")
+        self.assertIsNone(dr.prefix_match.host_lock)
 
     def test_device_resident_promise_needs_no_dma(self, match_prefix):
         # Another request already loaded the promised range back to device.
         match_prefix.return_value = _rematch(torch.tensor([10, 11, 12, 13]))
         tree_cache = _tree_cache(new_indices=torch.tensor([], dtype=torch.int64))
-        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=2, l3=0)
+        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=2)
 
         queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
             SimpleNamespace(tree_cache=tree_cache), dr
@@ -112,7 +114,7 @@ class TestDecodeRestoreIsKvOnly(CustomTestCase):
     def test_short_coverage_fails_the_restore(self, match_prefix):
         match_prefix.return_value = _rematch(torch.tensor([10, 11]), host_hit_length=2)
         tree_cache = _tree_cache(new_indices=torch.tensor([], dtype=torch.int64))
-        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=2, l3=0)
+        dr = _decode_req(prefix_indices=torch.tensor([10, 11]), l2=2)
 
         queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
             SimpleNamespace(tree_cache=tree_cache), dr
@@ -121,6 +123,7 @@ class TestDecodeRestoreIsKvOnly(CustomTestCase):
         self.assertFalse(queued)
         self.assertEqual(dr.hicache_restore_status, HiCacheRestoreResult.FAILED)
         tree_cache.inc_lock_ref.assert_not_called()
+        tree_cache.dec_host_lock_ref.assert_called_once_with(5, "pin")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
+    DecLockRefParams,
     InitLoadBackParams,
 )
 
@@ -25,12 +26,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DecodePrefixMatch:
+    """The prefix decode promises prefill it already holds: ``[0, l1)`` on
+    device and ``[l1, l1 + l2)`` on host, each pinned until the restore owns
+    it. L3 hits are staged into the host tier before they are promised."""
+
     prefix_indices: torch.Tensor
     l2_host_hit_length: int
-    l3_storage_hit_length: int
     last_device_node: Any
-    last_host_node: Any = None
-    prefetch_registered: bool = False
+    host_anchor: Any = None
+    host_lock: Optional[DecLockRefParams] = None
 
     @property
     def l1_prefix_len(self) -> int:
@@ -38,7 +42,7 @@ class DecodePrefixMatch:
 
     @property
     def decode_prefix_len(self) -> int:
-        return self.l1_prefix_len + self.l2_host_hit_length + self.l3_storage_hit_length
+        return self.l1_prefix_len + self.l2_host_hit_length
 
     @property
     def needs_local_restore(self) -> bool:
@@ -46,8 +50,15 @@ class DecodePrefixMatch:
 
     @property
     def restore_token_count(self) -> int:
-        """Number of tokens that need L2/L3 load_back to device."""
+        """Number of tokens that need L2 load_back to device."""
         return self.decode_prefix_len - self.l1_prefix_len
+
+
+def release_host_promise(tree_cache, prefix_match: Optional[DecodePrefixMatch]) -> None:
+    """Unpin the host part of a promise; the restore pins its own pages."""
+    if prefix_match is not None and prefix_match.host_lock is not None:
+        tree_cache.dec_host_lock_ref(prefix_match.host_anchor, prefix_match.host_lock)
+        prefix_match.host_lock = None
 
 
 class HiCacheRestoreResult(Enum):
@@ -59,115 +70,101 @@ class HiCacheRestoreResult(Enum):
 
 
 class DecodeHiCachePreallocMixin:
-    """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
+    """HiCache hooks for ``DecodePreallocQueue``: stage L3 hits, pin promises,
+    reserve restore tokens."""
 
-    def _build_decode_prefix_match(
-        self, req: Req, result: Any, reusable_len: int
-    ) -> DecodePrefixMatch:
-        """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
-
-        Performs the optional L3 storage hit length query when decode-side
-        HiCache is enabled and the last host node is backed up. Like the tree
-        match, the query stops at ``reusable_len``.
-        """
-        prefix_indices = result.device_indices
-        l1_prefix_len = len(prefix_indices)
+    def _build_decode_prefix_match(self, result: Any) -> DecodePrefixMatch:
+        """Turn a ``match_prefix_for_req`` result into the promise, pinning its
+        host part: host eviction would otherwise leave it unrestorable once
+        prefill has trimmed its transfer to ``decode_prefix_len``."""
         l2_host_hit_length = result.host_hit_length
-
-        l3_storage_hit_length = 0
-        last_host_node = None
-        if self.scheduler.enable_decode_hicache:
-            last_host_node = result.last_host_node
-            if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
-                last_host_node
-            ):
-                matched_len = l1_prefix_len + l2_host_hit_length
-                suffix_tokens = req.origin_input_ids[matched_len:reusable_len]
-                last_hash = self.tree_cache.get_last_hash_value(last_host_node)
-                prefix_keys = (
-                    self.tree_cache.get_prefix_hash_values(last_host_node)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
-                )
-                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    result.last_host_node,
-                    suffix_tokens,
-                    last_hash,
-                    prefix_keys,
-                    extra_key=req.extra_key,
-                    cache_salt=req.cache_salt,
-                )
-
+        host_anchor = host_lock = None
+        if l2_host_hit_length > 0:
+            host_anchor = result.best_match_node
+            host_lock = self.tree_cache.inc_host_lock_ref(host_anchor).to_dec_params()
         return DecodePrefixMatch(
-            prefix_indices=prefix_indices,
+            prefix_indices=result.device_indices,
             l2_host_hit_length=l2_host_hit_length,
-            l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
-            last_host_node=(
-                result.last_host_node if l3_storage_hit_length > 0 else None
-            ),
+            host_anchor=host_anchor,
+            host_lock=host_lock,
         )
 
-    def _start_hicache_prefetch(
-        self, req: Req, prefix_match: Optional[DecodePrefixMatch]
-    ) -> None:
-        """Issue L3 storage prefetch after admission succeeds.
+    def _stage_from_storage(self, req: Req, result: Any, reusable_len: int) -> bool:
+        """Fetch the L3 part of the reusable prefix into the host tier; True
+        when a fetch is in flight.
 
-        On failure, degrades to L2-only restore by clearing l3 fields.
+        Promising an L3 hit directly would break the request whenever the
+        fetch comes back short (host capacity, storage errors) after prefill
+        has trimmed its transfer. Staged first, a short or declined fetch only
+        shrinks what is promised once the request is matched again.
         """
-        if (
-            prefix_match is None
-            or prefix_match.l3_storage_hit_length <= 0
-            or prefix_match.last_host_node is None
-        ):
-            return
+        anchor = result.last_host_node
+        if not (self.tree_cache.is_backuped(anchor) or self.tree_cache.is_root(anchor)):
+            return False
+        matched_len = len(result.device_indices) + result.host_hit_length
+        suffix = req.origin_input_ids[matched_len:reusable_len]
+        if len(suffix) == 0:
+            return False
         try:
-            matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
-                matched_len : matched_len + prefix_match.l3_storage_hit_length
-            ]
-            last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
+            last_hash = self.tree_cache.get_last_hash_value(anchor)
             prefix_keys = (
-                self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
+                self.tree_cache.get_prefix_hash_values(anchor)
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
-            self.tree_cache.prefetch_from_storage(
-                req.cache_request_handle,
-                prefix_match.last_host_node,
+            hit = self.tree_cache.query_storage_hit_length(
+                anchor,
                 suffix,
                 last_hash,
                 prefix_keys,
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
-                # Base KV only, which the KV-only hit query promised; hybrid
-                # component fetches would be all-or-nothing on top of it.
+            )
+            if hit <= 0:
+                return False
+            self.tree_cache.prefetch_from_storage(
+                req.cache_request_handle,
+                anchor,
+                suffix[:hit],
+                last_hash,
+                prefix_keys,
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
+                # Base KV only: the transfer brings the SWA window and the
+                # Mamba state, and the hit query counts base KV only.
                 kv_only=True,
             )
-            prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
-                req.cache_request_handle
-            )
-            if not prefix_match.prefetch_registered:
-                # A silently declined prefetch leaves the promised L3 range
-                # unrestorable; degrade to L2-only.
-                logger.warning(
-                    "HiCache L3 prefetch declined for rid=%s (len=%s); "
-                    "falling back to L2-only LoadingBack",
-                    req.rid,
-                    prefix_match.l3_storage_hit_length,
-                )
-                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
-                "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
+                "HiCache L3 prefetch failed for rid=%s: %s; promising L1/L2 only",
                 req.rid,
                 e,
             )
-            prefix_match.l3_storage_hit_length = 0
-            prefix_match.prefetch_registered = False
+            return False
+        return self.tree_cache.has_ongoing_prefetch(req.cache_request_handle)
+
+    def _poll_hicache_staging(self, decode_req: DecodeRequest) -> bool:
+        """True once the request's L3 fetch, if any, has resolved; its pages
+        are then host-resident and the next match promises them as L2."""
+        if not decode_req.hicache_staging:
+            return True
+        handle = decode_req.req.cache_request_handle
+        if not self.tree_cache.check_prefetch_progress(handle):
+            return False
+        self.tree_cache.pop_prefetch_loaded_tokens(handle)
+        decode_req.hicache_staging = False
+        return True
+
+    def _abort_hicache_staging(self, decode_req: DecodeRequest) -> None:
+        if decode_req.hicache_staging:
+            self.tree_cache.finish(
+                decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
+            )
+            decode_req.hicache_staging = False
 
     def _hicache_pending_restore_tokens(self) -> int:
-        """Total device tokens reserved for pending HiCache L2/L3 load_back."""
+        """Total device tokens reserved for pending HiCache L2 load_back."""
         if not self.scheduler.enable_decode_hicache:
             return 0
         return sum(
@@ -198,14 +195,8 @@ class HiCacheRestoreGatedKVReceiver:
 class DecodeHiCacheTransferMixin:
     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""
 
-    def _clean_hicache_prefetch_resources(self, decode_req: DecodeRequest) -> None:
-        if (
-            decode_req.prefix_match is not None
-            and decode_req.prefix_match.prefetch_registered
-        ):
-            self.tree_cache.finish(
-                decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
-            )
+    def _clean_hicache_restore_resources(self, decode_req: DecodeRequest) -> None:
+        release_host_promise(self.tree_cache, decode_req.prefix_match)
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(
                 decode_req.hicache_restored_node,
@@ -223,12 +214,6 @@ class DecodeHiCacheTransferMixin:
         Failback paths flip to FAILED.
         """
         pm = dr.prefix_match
-
-        # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
-        if pm.l3_storage_hit_length > 0:
-            if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
-                return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match the promised range the way admission matched it: FULL KV
         # only. Restore it KV-only too: the SWA window and the Mamba state
@@ -250,6 +235,8 @@ class DecodeHiCacheTransferMixin:
                 kv_only=True,
             )
         )
+        # The load-back pins the host pages it reads; the promise's pin is done.
+        release_host_promise(self.tree_cache, pm)
         # The rematch repointed req.last_node to feed init_load_back's device
         # boundary, but the prealloc lock and the receipt on the req still
         # belong to pm.last_device_node; restore the pairing so any release
@@ -260,14 +247,13 @@ class DecodeHiCacheTransferMixin:
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
             logger.warning(
                 "HiCache load_back failed for rid=%s: device_indices=%d, "
-                "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
+                "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d)",
                 dr.req.rid,
                 len(rematch.device_indices),
                 len(new_indices),
                 pm.decode_prefix_len,
                 pm.l1_prefix_len,
                 pm.l2_host_hit_length,
-                pm.l3_storage_hit_length,
             )
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False

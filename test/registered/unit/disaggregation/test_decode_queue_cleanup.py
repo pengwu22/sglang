@@ -115,7 +115,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             return_logprob=False,
         )
         decode_req = SimpleNamespace(
-            req=req, kv_receiver=receiver, waiting_for_input=True
+            req=req, kv_receiver=receiver, waiting_for_input=True, hicache_staging=False
         )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -177,7 +177,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
             kv=ReqKvInfo(),
             return_logprob=False,
         )
-        decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
+        decode_req = SimpleNamespace(
+            req=req, kv_receiver=receiver, hicache_staging=False
+        )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
@@ -227,6 +229,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             kv_receiver=receiver,
             waiting_for_input=True,
             is_rebootstrap=False,
+            hicache_staging=False,
         )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -380,7 +383,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
-        queue._clean_hicache_prefetch_resources = MagicMock()
+        queue._clean_hicache_restore_resources = MagicMock()
 
         scheduler = MagicMock()
         scheduler.enable_decode_hicache = False
@@ -496,7 +499,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
-        queue._clean_hicache_prefetch_resources = MagicMock()
+        queue._clean_hicache_restore_resources = MagicMock()
         queue.scheduler = MagicMock(enable_decode_hicache=False, enable_hisparse=False)
         queue.scheduler.metrics_reporter.enable_metrics = False
         mock_poll.return_value = [KVPoll.Failed]

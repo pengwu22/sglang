@@ -380,7 +380,7 @@ def _make_pop_queue(mgr):
         metrics_reporter=SimpleNamespace(enable_metrics=False),
     )
     q._poll_with_metadata_gate = lambda: [KVPoll.Failed] * len(q.queue)
-    q._clean_hicache_prefetch_resources = lambda decode_req: None
+    q._clean_hicache_restore_resources = lambda decode_req: None
     return q
 
 

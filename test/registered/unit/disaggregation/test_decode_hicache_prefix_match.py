@@ -10,7 +10,7 @@ import torch
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
-    DecodePrefixMatch,
+    release_host_promise,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,14 +32,22 @@ def _req() -> SimpleNamespace:
     )
 
 
+def _decode_req(req):
+    return SimpleNamespace(req=req, hicache_storage_tried=False)
+
+
 class TestDecodeAdmissionMatch(CustomTestCase):
-    def _harness(self, *, uses_swa_tail: bool, swa_tail_len: int) -> SimpleNamespace:
+    def _harness(
+        self, *, uses_swa_tail: bool, swa_tail_len: int, hicache: bool = False
+    ) -> SimpleNamespace:
         harness = SimpleNamespace(
+            scheduler=SimpleNamespace(enable_decode_hicache=hicache),
             tree_cache=Mock(),
             _uses_swa_tail_prealloc=lambda: uses_swa_tail,
             _pre_alloc_fill_len=DecodePreallocQueue._pre_alloc_fill_len,
             _swa_tail_len=lambda seq_len: swa_tail_len,
             _build_decode_prefix_match=Mock(),
+            _stage_from_storage=Mock(return_value=False),
         )
         harness._reusable_prefix_len = types.MethodType(
             DecodePreallocQueue._reusable_prefix_len, harness
@@ -52,112 +60,154 @@ class TestDecodeAdmissionMatch(CustomTestCase):
         # state, so decode reuses FULL KV only, and only before the tail.
         harness = self._harness(uses_swa_tail=True, swa_tail_len=512)
 
-        DecodePreallocQueue._match_prefix_and_lock(harness, _req())
+        DecodePreallocQueue._match_prefix_and_lock(harness, _decode_req(_req()))
 
         (_, _, token_ids), kwargs = match_prefix.call_args
         self.assertEqual(list(token_ids), list(range(PROMPT_LEN - 512)))
         self.assertTrue(kwargs["kv_only"])
         self.assertFalse(kwargs.get("cow_mamba", False))
         harness._build_decode_prefix_match.assert_called_once()
-        self.assertEqual(
-            harness._build_decode_prefix_match.call_args.args[2], PROMPT_LEN - 512
-        )
 
     @patch("sglang.srt.disaggregation.decode.match_prefix_for_req")
     def test_whole_prompt_is_reusable_without_swa_tail(self, match_prefix):
         harness = self._harness(uses_swa_tail=False, swa_tail_len=0)
 
-        DecodePreallocQueue._match_prefix_and_lock(harness, _req())
+        DecodePreallocQueue._match_prefix_and_lock(harness, _decode_req(_req()))
 
         (_, _, token_ids), kwargs = match_prefix.call_args
         self.assertEqual(len(token_ids), PROMPT_LEN)
         self.assertTrue(kwargs["kv_only"])
 
+    @patch("sglang.srt.disaggregation.decode.match_prefix_for_req")
+    def test_l3_hit_is_staged_before_anything_is_promised(self, match_prefix):
+        # A started fetch defers the promise: no lock, no prefix match, and
+        # storage is not consulted again when the request is matched next.
+        harness = self._harness(uses_swa_tail=False, swa_tail_len=0, hicache=True)
+        harness._stage_from_storage.return_value = True
+        decode_req = _decode_req(_req())
 
-class TestDecodeHiCacheStorageQuery(CustomTestCase):
-    def test_storage_query_stops_at_the_reusable_len(self):
-        tree_cache = SimpleNamespace(
-            hicache_storage_pass_prefix_keys=False,
-            is_backuped=Mock(return_value=True),
-            is_root=Mock(return_value=False),
-            get_last_hash_value=Mock(return_value="hash"),
-            query_storage_hit_length=Mock(return_value=1024),
+        self.assertIsNone(
+            DecodePreallocQueue._match_prefix_and_lock(harness, decode_req)
         )
-        harness = SimpleNamespace(
-            scheduler=SimpleNamespace(enable_decode_hicache=True),
-            tree_cache=tree_cache,
-        )
+        harness.tree_cache.inc_lock_ref.assert_not_called()
+        harness._build_decode_prefix_match.assert_not_called()
+        self.assertEqual(harness._stage_from_storage.call_args.args[2], PROMPT_LEN)
+
+        DecodePreallocQueue._match_prefix_and_lock(harness, decode_req)
+
+        harness._stage_from_storage.assert_called_once()
+        harness._build_decode_prefix_match.assert_called_once()
+
+
+class TestDecodePromiseIsPinned(CustomTestCase):
+    def test_host_part_of_the_promise_is_pinned_until_released(self):
+        tree_cache = Mock()
+        tree_cache.inc_host_lock_ref.return_value.to_dec_params.return_value = "pin"
+        harness = SimpleNamespace(tree_cache=tree_cache)
         result = SimpleNamespace(
             device_indices=torch.arange(128),
             host_hit_length=256,
-            last_host_node=22,
             last_device_node=11,
+            best_match_node=33,
         )
 
-        match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
-            harness, _req(), result, reusable_len=1536
+        match = DecodeHiCachePreallocMixin._build_decode_prefix_match(harness, result)
+
+        tree_cache.inc_host_lock_ref.assert_called_once_with(33)
+        self.assertEqual(match.decode_prefix_len, 384)
+        self.assertEqual(match.restore_token_count, 256)
+
+        release_host_promise(tree_cache, match)
+        release_host_promise(tree_cache, match)
+
+        tree_cache.dec_host_lock_ref.assert_called_once_with(33, "pin")
+
+    def test_device_only_promise_takes_no_host_pin(self):
+        tree_cache = Mock()
+        harness = SimpleNamespace(tree_cache=tree_cache)
+        result = SimpleNamespace(
+            device_indices=torch.arange(128),
+            host_hit_length=0,
+            last_device_node=11,
+            best_match_node=11,
         )
 
-        suffix = tree_cache.query_storage_hit_length.call_args.args[1]
-        self.assertEqual(list(suffix), list(range(384, 1536)))
-        self.assertEqual(match.l2_host_hit_length, 256)
-        self.assertEqual(match.l3_storage_hit_length, 1024)
-        self.assertEqual(match.decode_prefix_len, 1408)
-        self.assertEqual(match.last_host_node, 22)
+        match = DecodeHiCachePreallocMixin._build_decode_prefix_match(harness, result)
+
+        tree_cache.inc_host_lock_ref.assert_not_called()
+        self.assertFalse(match.needs_local_restore)
 
 
-class TestDecodeHiCachePrefetchDecline(CustomTestCase):
-    def _prefetch(self, *, registers: bool) -> DecodePrefixMatch:
+class TestDecodeHiCacheStaging(CustomTestCase):
+    def _tree_cache(self, *, hit: int, registers: bool) -> SimpleNamespace:
         ongoing_prefetch = {}
 
         def prefetch_from_storage(req_id, *_args, **_kwargs):
             if registers:
                 ongoing_prefetch[req_id] = object()
 
-        harness = SimpleNamespace(
-            tree_cache=SimpleNamespace(
-                hicache_storage_pass_prefix_keys=False,
-                ongoing_prefetch=ongoing_prefetch,
-                has_ongoing_prefetch=ongoing_prefetch.__contains__,
-                get_last_hash_value=Mock(return_value="hash"),
-                prefetch_from_storage=Mock(side_effect=prefetch_from_storage),
-            ),
+        return SimpleNamespace(
+            hicache_storage_pass_prefix_keys=False,
+            has_ongoing_prefetch=ongoing_prefetch.__contains__,
+            is_backuped=Mock(return_value=True),
+            is_root=Mock(return_value=False),
+            get_last_hash_value=Mock(return_value="hash"),
+            query_storage_hit_length=Mock(return_value=hit),
+            prefetch_from_storage=Mock(side_effect=prefetch_from_storage),
         )
-        prefix_match = DecodePrefixMatch(
-            prefix_indices=torch.arange(256),
-            l2_host_hit_length=0,
-            l3_storage_hit_length=512,
-            last_device_node=11,
+
+    def _stage(self, tree_cache, *, reusable_len=1536) -> bool:
+        result = SimpleNamespace(
+            device_indices=torch.arange(128),
+            host_hit_length=256,
             last_host_node=22,
+            last_device_node=11,
         )
-        DecodeHiCachePreallocMixin._start_hicache_prefetch(
-            harness, _req(), prefix_match
+        return DecodeHiCachePreallocMixin._stage_from_storage(
+            SimpleNamespace(tree_cache=tree_cache), _req(), result, reusable_len
         )
-        self.prefetch_call = harness.tree_cache.prefetch_from_storage.call_args
-        return prefix_match
 
-    def test_registered_prefetch_keeps_l3_promise(self):
-        prefix_match = self._prefetch(registers=True)
+    def test_query_and_fetch_stop_at_the_reusable_len_kv_only(self):
+        tree_cache = self._tree_cache(hit=1024, registers=True)
 
-        self.assertTrue(prefix_match.prefetch_registered)
-        self.assertEqual(prefix_match.l3_storage_hit_length, 512)
+        self.assertTrue(self._stage(tree_cache))
 
-    def test_prefetch_is_kv_only(self):
-        # The hit query is KV-only; fetching component objects too would make
-        # a hybrid prefetch all-or-nothing on state decode never reads.
-        self._prefetch(registers=True)
+        suffix = tree_cache.query_storage_hit_length.call_args.args[1]
+        self.assertEqual(list(suffix), list(range(384, 1536)))
+        fetch = tree_cache.prefetch_from_storage.call_args
+        self.assertEqual(list(fetch.args[2]), list(range(384, 1408)))
+        # The hit query counts base KV only; component fetches would make a
+        # hybrid fetch all-or-nothing on state decode never reads.
+        self.assertTrue(fetch.kwargs["kv_only"])
 
-        self.assertTrue(self.prefetch_call.kwargs["kv_only"])
+    def test_storage_miss_fetches_nothing(self):
+        tree_cache = self._tree_cache(hit=0, registers=True)
 
-    def test_declined_prefetch_degrades_to_l2_only(self):
-        # A silently declined prefetch (rate limit, host buffer alloc failure)
-        # would leave the promised L3 range unrestorable after the transfer
-        # was already trimmed by decode_prefix_len.
-        prefix_match = self._prefetch(registers=False)
+        self.assertFalse(self._stage(tree_cache))
 
-        self.assertFalse(prefix_match.prefetch_registered)
-        self.assertEqual(prefix_match.l3_storage_hit_length, 0)
-        self.assertEqual(prefix_match.decode_prefix_len, 256)
+        tree_cache.prefetch_from_storage.assert_not_called()
+
+    def test_declined_fetch_promises_without_waiting(self):
+        # A silently declined fetch (rate limit, host buffer) must not leave
+        # the request waiting on a prefetch that was never registered.
+        self.assertFalse(self._stage(self._tree_cache(hit=1024, registers=False)))
+
+    def test_poll_waits_for_the_fetch_then_consumes_it(self):
+        tree_cache = SimpleNamespace(
+            check_prefetch_progress=Mock(side_effect=[False, True]),
+            pop_prefetch_loaded_tokens=Mock(),
+        )
+        harness = SimpleNamespace(tree_cache=tree_cache)
+        decode_req = SimpleNamespace(req=_req(), hicache_staging=True)
+
+        self.assertFalse(
+            DecodeHiCachePreallocMixin._poll_hicache_staging(harness, decode_req)
+        )
+        self.assertTrue(
+            DecodeHiCachePreallocMixin._poll_hicache_staging(harness, decode_req)
+        )
+        self.assertFalse(decode_req.hicache_staging)
+        tree_cache.pop_prefetch_loaded_tokens.assert_called_once()
 
 
 if __name__ == "__main__":

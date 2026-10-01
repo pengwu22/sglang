@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+    release_host_promise,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -357,6 +358,10 @@ class DecodeRequest:
     hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    # An L3 -> L2 fetch is in flight; the request waits unpinned in the queue.
+    hicache_staging: bool = False
+    # Storage is consulted once per request; the next match promises L1 + L2.
+    hicache_storage_tried: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -792,11 +797,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
-    def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
+    def _match_prefix_and_lock(
+        self, decode_req: DecodeRequest
+    ) -> Optional[DecodePrefixMatch]:
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
+        Returns None, holding nothing, when an L3 fetch was started instead.
         """
+        req = decode_req.req
         reusable_len = self._reusable_prefix_len(req)
         # FULL KV only: the SWA window and the Mamba state always come from
         # the prefill transfer, so the cached ones are neither needed nor
@@ -808,13 +817,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
             kv_only=True,
         )
+        if (
+            self.scheduler.enable_decode_hicache
+            and not decode_req.hicache_storage_tried
+        ):
+            decode_req.hicache_storage_tried = True
+            if self._stage_from_storage(req, result, reusable_len):
+                return None
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref; the full receipt
         # travels on the req so every later release mirrors this acquire.
         req.lock_receipt = self.tree_cache.inc_lock_ref(
             result.last_device_node
         ).to_dec_params()
-        return self._build_decode_prefix_match(req, result, reusable_len)
+        return self._build_decode_prefix_match(result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -943,6 +959,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
+        for decode_req in self.queue:
+            self._abort_hicache_staging(decode_req)
         self.queue.clear()
         for req in self.retracted_queue:
             discard_kv_cache_backup(
@@ -1302,6 +1320,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                self._abort_hicache_staging(decode_req)
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -1411,8 +1430,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and not decode_req.is_rebootstrap
             )
             if use_decode_radix_cache:
+                if not self._poll_hicache_staging(decode_req):
+                    continue
                 # Match prefix against decode's radix cache.
-                prefix_match = self._match_prefix_and_lock(decode_req.req)
+                prefix_match = self._match_prefix_and_lock(decode_req)
+                if prefix_match is None:
+                    decode_req.hicache_staging = True
+                    continue
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1488,6 +1512,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
+                release_host_promise(self.tree_cache, prefix_match)
                 break
 
             if swa_allocatable_tokens is not None:
@@ -1499,6 +1524,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if reclaim_error is not None:
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                         self._release_matched_prefix_lock(decode_req.req)
+                    release_host_promise(self.tree_cache, prefix_match)
                     logger.error(reclaim_error)
                     prepare_abort(
                         decode_req.req,
@@ -1513,12 +1539,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-            # Prefetch before allocation: a declined prefetch degrades the
-            # promised L3 range, which the alloc and metadata must reflect.
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache and prefix_match is not None:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
-                total_prefix_len = min(total_prefix_len, prefix_match.decode_prefix_len)
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -2660,7 +2681,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     except Exception as e:
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
-                self._clean_hicache_prefetch_resources(decode_req)
+                self._clean_hicache_restore_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2745,7 +2766,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.hisparse_coordinator.request_finished(
                             decode_req.req
                         )
-                    self._clean_hicache_prefetch_resources(decode_req)
+                    self._clean_hicache_restore_resources(decode_req)
                     self._release_request(decode_req)
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()

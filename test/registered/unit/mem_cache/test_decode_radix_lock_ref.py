@@ -491,7 +491,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             return_value=DecodePrefixMatch(
                 prefix_indices=torch.arange(4, dtype=torch.int64),
                 l2_host_hit_length=0,
-                l3_storage_hit_length=0,
                 last_device_node=req.last_node,
             )
         )
@@ -581,7 +580,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         decode_req.prefix_match = DecodePrefixMatch(
             prefix_indices=torch.arange(4, dtype=torch.int64),
             l2_host_hit_length=4,
-            l3_storage_hit_length=0,
             last_device_node=prealloc_node,
         )
         decode_req.hicache_restored_node = restored_node

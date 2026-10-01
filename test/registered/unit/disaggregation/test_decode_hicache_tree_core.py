@@ -6,15 +6,31 @@ from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.disaggregation.decode_hicache_mixin import (
-    DecodeHiCachePreallocMixin,
-    DecodePrefixMatch,
-)
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCachePreallocMixin
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _req():
+    return SimpleNamespace(
+        rid="req-0",
+        cache_request_handle=CacheRequestHandle("req-0", 0),
+        origin_input_ids=[0, 1, 2, 3, 4, 5, 6, 7],
+        extra_key="model",
+        cache_salt="tenant-a",
+    )
+
+
+def _result():
+    return SimpleNamespace(
+        device_indices=torch.tensor([10, 11]),
+        host_hit_length=2,
+        last_device_node=11,
+        last_host_node=22,
+    )
 
 
 class TestDecodeHiCacheTreeCore(CustomTestCase):
@@ -26,7 +42,6 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
 
         tree_cache = SimpleNamespace(
             hicache_storage_pass_prefix_keys=True,
-            ongoing_prefetch=ongoing_prefetch,
             has_ongoing_prefetch=ongoing_prefetch.__contains__,
             is_backuped=Mock(return_value=True),
             is_root=Mock(return_value=False),
@@ -35,29 +50,14 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             query_storage_hit_length=Mock(return_value=2),
             prefetch_from_storage=Mock(side_effect=register_prefetch),
         )
-        harness = SimpleNamespace(
-            scheduler=SimpleNamespace(enable_decode_hicache=True),
-            tree_cache=tree_cache,
-        )
-        req = SimpleNamespace(
-            rid="req-0",
-            cache_request_handle=CacheRequestHandle("req-0", 0),
-            origin_input_ids=[0, 1, 2, 3, 4, 5, 6, 7],
-            extra_key="model",
-            cache_salt="tenant-a",
-        )
-        result = SimpleNamespace(
-            device_indices=torch.tensor([10, 11]),
-            host_hit_length=2,
-            last_device_node=11,
-            last_host_node=22,
+        harness = SimpleNamespace(tree_cache=tree_cache)
+        req = _req()
+
+        staged = DecodeHiCachePreallocMixin._stage_from_storage(
+            harness, req, _result(), reusable_len=8
         )
 
-        prefix_match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
-            harness, req, result, reusable_len=8
-        )
-
-        self.assertEqual(prefix_match.l3_storage_hit_length, 2)
+        self.assertTrue(staged)
         tree_cache.query_storage_hit_length.assert_called_once_with(
             22,
             [4, 5, 6, 7],
@@ -66,10 +66,6 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             extra_key="model",
             cache_salt="tenant-a",
         )
-
-        DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, prefix_match)
-
-        self.assertTrue(prefix_match.prefetch_registered)
         tree_cache.prefetch_from_storage.assert_called_once_with(
             req.cache_request_handle,
             22,
@@ -81,34 +77,23 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             kv_only=True,
         )
 
-    def test_stale_prefetch_anchor_degrades_to_l2(self):
+    def test_stale_prefetch_anchor_stages_nothing(self):
         tree_cache = SimpleNamespace(
             hicache_storage_pass_prefix_keys=True,
-            ongoing_prefetch={},
+            is_backuped=Mock(return_value=True),
+            is_root=Mock(return_value=False),
             get_last_hash_value=Mock(side_effect=KeyError(22)),
             get_prefix_hash_values=Mock(),
+            query_storage_hit_length=Mock(),
             prefetch_from_storage=Mock(),
         )
         harness = SimpleNamespace(tree_cache=tree_cache)
-        req = SimpleNamespace(
-            rid="req-0",
-            cache_request_handle=CacheRequestHandle("req-0", 0),
-            origin_input_ids=[0, 1, 2, 3, 4, 5],
-            extra_key=None,
-            cache_salt=None,
-        )
-        prefix_match = DecodePrefixMatch(
-            prefix_indices=torch.tensor([10, 11]),
-            l2_host_hit_length=2,
-            l3_storage_hit_length=2,
-            last_device_node=11,
-            last_host_node=22,
+
+        staged = DecodeHiCachePreallocMixin._stage_from_storage(
+            harness, _req(), _result(), reusable_len=8
         )
 
-        DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, prefix_match)
-
-        self.assertEqual(prefix_match.l3_storage_hit_length, 0)
-        self.assertFalse(prefix_match.prefetch_registered)
+        self.assertFalse(staged)
         tree_cache.get_prefix_hash_values.assert_not_called()
         tree_cache.prefetch_from_storage.assert_not_called()
 
