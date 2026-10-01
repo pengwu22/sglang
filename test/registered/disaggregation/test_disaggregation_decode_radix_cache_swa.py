@@ -91,6 +91,75 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
 
 
 @unittest.skipUnless(
+    is_in_ci() or _has_nixl(),
+    "NIXL is required for decode radix cache disaggregation coverage.",
+)
+class TestDisaggregationDecodeRadixCacheSWASharedPrefix(PDDisaggregationServerBase):
+    """A decode L1 hit on a shared prefix whose SWA window is tombstoned.
+
+    Decode keeps only a request's trailing SWA window, so a prefix shared with
+    an earlier request ends where that request holds no SWA state. Decode reuses
+    the prefix's full-attention KV anyway (the window comes with the transfer),
+    and greedy output must match a cold decode. Prefill's radix cache is off so
+    cached_tokens counts decode-side reuse only.
+    """
+
+    transfer_backend_name = "nixl"
+    extra_prefill_args = [*SWA_SERVER_ARGS, "--disable-radix-cache"]
+    extra_decode_args = [
+        "--disaggregation-decode-enable-radix-cache",
+        *SWA_SERVER_ARGS,
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE)
+        cls.transfer_backend = [
+            "--disaggregation-transfer-backend",
+            cls.transfer_backend_name,
+        ]
+        cls.launch_all()
+
+    def _generate(self, input_ids):
+        response = requests.post(
+            f"{self.lb_url}/generate",
+            json={
+                "input_ids": input_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 16,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        meta = response.json()["meta_info"]
+        return meta["cached_tokens"], meta["output_token_logprobs"]
+
+    def test_shared_prefix_hit_matches_cold_decode(self):
+        header = [1000 + (7 * i) % 20000 for i in range(1024)]
+        prompt = header + [40000 + i for i in range(256)]
+        self._generate(header + [30000 + i for i in range(256)])
+
+        cached_tokens, warm = self._generate(prompt)
+        self.assertGreaterEqual(
+            cached_tokens, len(header), "decode did not reuse the shared prefix"
+        )
+        response = requests.post(
+            f"{self.decode_url}/flush_cache?timeout=30", timeout=60
+        )
+        response.raise_for_status()
+        _, cold = self._generate(prompt)
+
+        self.assertEqual([item[1] for item in warm], [item[1] for item in cold])
+        for reference, actual in zip(cold, warm, strict=True):
+            self.assertAlmostEqual(reference[0], actual[0], delta=0.05)
+
+
+@unittest.skipUnless(
     is_in_ci() or _has_mooncake(),
     "Mooncake is required for decode radix cache disaggregation coverage.",
 )
