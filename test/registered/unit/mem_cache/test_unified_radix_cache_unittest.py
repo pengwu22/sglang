@@ -1568,6 +1568,25 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
+    def test_empty_key_match_is_a_root_miss(self):
+        # A write-only PD decode cache admits with the empty key: it must reuse
+        # nothing even with the request's prefix resident, and locking the
+        # matched root must not protect any cached tokens.
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._insert(cache, allocator, req_to_token_pool, self._make_seq(1, 2))
+        evictable = cache.evictable_size()
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q"))))
+        receipt = cache.inc_lock_ref(m.last_device_node)
+
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertEqual(m.host_hit_length, 0)
+        self.assertTrue(cache.is_root(m.last_device_node))
+        self.assertEqual(cache.evictable_size(), evictable)
+        cache.dec_lock_ref(m.last_device_node, receipt.to_dec_params())
+        self.assertEqual(cache.evictable_size(), evictable)
+        cache.sanity_check()
+
     def test_cache_salt_and_extra_key_form_independent_namespaces(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)

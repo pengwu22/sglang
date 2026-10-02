@@ -84,6 +84,23 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_cache_write_only
+        and not (
+            cfg.disaggregation_decode_enable_radix_cache
+            and cfg.enable_hierarchical_cache
+            and cfg.hicache_storage_backend is not None
+        )
+    ):
+        raise ValueError(
+            "--disaggregation-decode-cache-write-only requires "
+            "--disaggregation-decode-enable-radix-cache, "
+            "--enable-hierarchical-cache and --hicache-storage-backend: "
+            "decode writes its KV through the radix tree's hierarchical cache "
+            "to the storage backend."
+        )
+
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
             if cfg.enable_hisparse:

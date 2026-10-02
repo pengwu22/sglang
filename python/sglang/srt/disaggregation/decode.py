@@ -788,11 +788,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        write_only = get_disagg().disaggregation_decode_cache_write_only
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            req.origin_input_ids[:0] if write_only else req.origin_input_ids,
+            cow_mamba=self.tree_cache.supports_mamba() and not write_only,
             include_req=True,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
@@ -801,6 +802,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.lock_receipt = self.tree_cache.inc_lock_ref(
             result.last_device_node
         ).to_dec_params()
+        if write_only:
+            return DecodePrefixMatch(
+                prefix_indices=result.device_indices,
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=result.last_device_node,
+            )
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:

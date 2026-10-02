@@ -323,12 +323,18 @@ def build_kv_cache(
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            if enable_hierarchical_cache:
+            # A write-only cache never restores from the host or storage
+            # tiers; it only backs up its commits, as the colocated SWA tree does.
+            if (
+                enable_hierarchical_cache
+                and not get_disagg().disaggregation_decode_cache_write_only
+            ):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache with sliding "
                     "window attention (SWA) models currently supports only "
                     "device-resident cache and is incompatible with "
-                    "--enable-hierarchical-cache."
+                    "--enable-hierarchical-cache unless "
+                    "--disaggregation-decode-cache-write-only is set."
                 )
             if getattr(model_config, "is_deepseek_v4_arch", False):
                 raise ValueError(
