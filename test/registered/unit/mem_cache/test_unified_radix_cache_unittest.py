@@ -3550,6 +3550,57 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(torch.equal(loaded_v, expected_v))
         cons.sanity_check()
 
+    def test_hicache_l3_prefetch_restores_a_sub_window_suffix_under_a_mid_tree_anchor(
+        self,
+    ):
+        """A stored continuation shorter than the sliding window restores under
+        a mid-tree anchor: the window head is the anchor path's own SWA."""
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("mamba L3 offload is out of scope for this unit fixture")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        base = self._make_seq(1, 2)
+        seq = base + self._make_seq(500, 2)
+
+        def stored_cache(stored_seq):
+            cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+            self._init_hicache(
+                cache,
+                storage_backend="file",
+                storage_dir=storage_dir,
+                prefetch_threshold=1,
+            )
+            self._insert(cache, allocator, req_to_token_pool, stored_seq)
+            m = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", stored_seq)))
+            )
+            node = m.last_device_node
+            self._backup_node(cache, node)
+            self._write_path_to_l3(cache, node)
+            self._flush_l3_backups(cache)
+            return cache, node
+
+        stored_cache(seq)
+        cache, anchor = stored_cache(base)
+
+        req_id = CacheRequestHandle("sub-window-suffix-req", 0)
+        cache.prefetch_from_storage(
+            req_id,
+            anchor,
+            array("q", seq[len(base) :]),
+            cache.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=array("q", base),
+        )
+        self._run_prefetch_to_completion(cache, req_id)
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(len(m.device_indices), len(base))
+        self.assertEqual(m.host_hit_length, len(seq) - len(base))
+        cache.sanity_check()
+
     def test_release_aborted_request_l3_prefetch_io_in_progress(self):
         """Test release_aborted_request while a prefetch IO is still in-progress.
         1. Fill KV and SWA to L3.
@@ -9127,7 +9178,7 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite):
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
     )
 
-    def test_mid_tree_shortened_swa_prefetch_is_released(self):
+    def test_mid_tree_sub_window_swa_prefetch_is_attached(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         prefix = [1, 2]
         self._insert(cache, allocator, req_to_token_pool, prefix)
@@ -9166,14 +9217,16 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite):
             ),
         )
 
-        self.assertIsNone(
-            _host_value(cache, insert_result.inserted_host_node, ComponentType.SWA)
+        # The window head stays with the anchor's path.
+        self.assertTrue(
+            torch.equal(
+                _host_value(
+                    cache, insert_result.inserted_host_node, ComponentType.SWA
+                ),
+                swa_host_indices,
+            )
         )
-        self.assertEqual(len(actions), 1)
-        self.assertIsInstance(actions[0], FreeComponentHostSlot)
-        self.assertEqual(actions[0].component_type, ComponentType.SWA)
-        self.assertEqual(len(actions[0].host_indices), 1)
-        self.assertTrue(torch.equal(actions[0].host_indices[0], swa_host_indices))
+        self.assertEqual(actions, [])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
